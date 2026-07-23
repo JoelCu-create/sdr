@@ -1,0 +1,300 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Accélérateur du relief automatique</title>
+<script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+<style>
+:root{font-family:Inter,Segoe UI,Arial,sans-serif;color-scheme:dark}*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px;background:#07111f;color:#eef4ff}.card{width:min(860px,100%);padding:28px;border:1px solid #334b6d;border-radius:16px;background:#0d1a2e;box-shadow:0 22px 70px #0008}h1{margin:0 0 10px;font-size:25px}p{color:#b9c8da;line-height:1.55}.box{margin:18px 0;padding:16px;border:1px solid #3d5577;border-radius:12px;background:#091528}input,button{width:100%;padding:12px;border:1px solid #4a6388;border-radius:9px;background:#0b1729;color:#eef4ff;font:inherit}button{margin-top:12px;background:#047857;border-color:#10b981;font-weight:800;cursor:pointer}button:disabled{opacity:.45;cursor:not-allowed}.status{min-height:70px;margin-top:14px;padding:12px;border-radius:9px;background:#081426;color:#cbd5e1;white-space:pre-wrap}.ok{color:#6ee7b7}.err{color:#fca5a5}code{color:#93c5fd}.note{font-size:13px;border-left:3px solid #38bdf8;padding-left:12px}.steps{margin:12px 0;color:#cbd5e1;line-height:1.55}
+</style>
+</head>
+<body>
+<main class="card">
+<h1>Accélérateur du relief automatique</h1>
+<p>Cette étape remplace le téléchargement ligne par ligne par plusieurs flux parallèles. Le cache IndexedDB et toutes les fonctions du planificateur sont conservés.</p>
+<div class="box">
+<input id="source" type="file" accept=".zip,.html,text/html,application/zip">
+<button id="patch" disabled>Générer la version accélérée</button>
+<div id="status" class="status">En attente du HTML ou du ZIP contenant la version avec relief automatique.</div>
+</div>
+<div class="steps">
+Fichier conseillé : <code>planificateur_radio_relief_automatique_routeur_complet.html</code>.<br>
+Tu peux aussi sélectionner un ZIP contenant ce fichier.
+</div>
+<p class="note">Le réglage par défaut utilise 6 flux simultanés, ce qui correspond à la limite pratique habituelle d’un navigateur vers un même serveur. Si le service IGN ralentit ou refuse des requêtes, sélectionne 3 ou 4 flux dans le planificateur généré.</p>
+</main>
+
+<script type="text/plain" id="parallel-ui">
+      <label>Téléchargement accéléré
+        <select id="localDemParallelism">
+          <option value="2">2 flux — très prudent</option>
+          <option value="3">3 flux — prudent</option>
+          <option value="4">4 flux — équilibré</option>
+          <option value="6" selected>6 flux — recommandé</option>
+          <option value="8">8 flux — agressif</option>
+        </select>
+      </label>
+</script>
+
+<script type="text/plain" id="parallel-code">
+function autoDemParallelism() {
+  const control = byId("localDemParallelism");
+  const selected = Number(control?.value);
+  if (Number.isFinite(selected) && selected >= 1) return Math.min(8,Math.max(1,Math.round(selected)));
+  try {
+    const saved = Number(localStorage.getItem("radioPlannerAutoDemParallelism"));
+    if (Number.isFinite(saved) && saved >= 1) return Math.min(8,Math.max(1,Math.round(saved)));
+  } catch (_) {}
+  return 6;
+}
+
+function autoDemFormatDuration(seconds) {
+  const safe = Math.max(0,Math.round(seconds));
+  const minutes = Math.floor(safe/60);
+  const remain = safe%60;
+  return minutes ? minutes+" min "+String(remain).padStart(2,"0")+" s" : remain+" s";
+}
+
+async function autoDemPrepare(routeState,settings,{force=false,manual=false}={}) {
+  await autoDemReady();
+  if (autoDemState.preparing) throw new Error("Une préparation du relief est déjà en cours.");
+  if (!routeState?.valid) throw new Error("Affecte exactement un départ et une arrivée.");
+  if (localDemState.tiles.length && !force) {
+    autoDemRefreshInfo("Dalles ASC manuelles déjà disponibles");
+    return true;
+  }
+
+  const envelope = autoDemBuildEnvelope(routeState,settings);
+  const existing = autoDemFindGridForEnvelope(envelope);
+  if (existing && !force) {
+    autoDemState.grids = [existing,...autoDemState.grids.filter(grid => grid !== existing)];
+    autoDemRefreshInfo("La zone demandée est déjà couverte");
+    localDemUpdateSummary();
+    return true;
+  }
+
+  const source = byId("terrainSource");
+  const previousSource = source?.value || "auto";
+  const values = new Float32Array(envelope.cols*envelope.rows);
+  const requestedParallelism = autoDemParallelism();
+  const workerCount = Math.max(1,Math.min(requestedParallelism,envelope.rows));
+  const startedAt = performance.now();
+  let nextRow = 0;
+  let completedRows = 0;
+  let firstFailure = null;
+  autoDemState.preparing = true;
+  operationCancelled = false;
+
+  try {
+    if (source) source.value = "ign";
+    showCalculationOverlay(envelope.rows,{
+      title:"Téléchargement accéléré du relief",
+      message:
+        "Zone "+Math.round((envelope.routeMaxM-envelope.routeMinM)/1000)+" × "+
+        Math.round((envelope.lateralMaxM-envelope.lateralMinM)/1000)+" km · "+
+        envelope.cols+" × "+envelope.rows+" points · pas "+Math.round(envelope.stepM)+" m · "+
+        workerCount+" flux parallèles.",
+      unitLabel:"ligne"
+    });
+
+    const runWorker = async workerIndex => {
+      while (true) {
+        throwIfOperationCancelled();
+        if (firstFailure) return;
+        const row = nextRow++;
+        if (row >= envelope.rows) return;
+
+        try {
+          const fraction = envelope.rows === 1 ? 0 : row/(envelope.rows-1);
+          const lateralM = envelope.lateralMinM+
+            (envelope.lateralMaxM-envelope.lateralMinM)*fraction;
+          const a = envelope.frame.toLatLon(envelope.routeMinM,lateralM);
+          const b = envelope.frame.toLatLon(envelope.routeMaxM,lateralM);
+
+          const raw = await fetchTerrain(
+            a,b,envelope.cols,"simple",
+            "Cache relief ligne "+(row+1)+"/"+envelope.rows,
+            {maxAttempts:5,timeoutMs:30000}
+          );
+
+          if (!Array.isArray(raw) || raw.length < envelope.cols) {
+            throw new Error("Réponse altimétrique incomplète pour la ligne "+(row+1)+".");
+          }
+
+          for (let column=0; column<envelope.cols; column++) {
+            const altitude = Number(raw[column]?.z);
+            if (!Number.isFinite(altitude)) {
+              throw new Error("Altitude invalide ligne "+(row+1)+", colonne "+(column+1)+".");
+            }
+            values[row*envelope.cols+column] = altitude;
+          }
+
+          completedRows++;
+          const elapsedSeconds = Math.max(.1,(performance.now()-startedAt)/1000);
+          const rowsPerSecond = completedRows/elapsedSeconds;
+          const remainingSeconds = rowsPerSecond > 0 ? (envelope.rows-completedRows)/rowsPerSecond : 0;
+          updateCalculationOverlay(
+            completedRows,
+            envelope.rows,
+            "Téléchargement accéléré du relief",
+            completedRows+"/"+envelope.rows+" lignes · "+
+            envelope.cols+" altitudes/ligne · "+workerCount+" flux · reste estimé "+
+            autoDemFormatDuration(remainingSeconds)+"."
+          );
+
+          if (completedRows % Math.max(1,workerCount) === 0) await waitForUiPaint();
+        } catch (error) {
+          firstFailure = error;
+          return;
+        }
+      }
+    };
+
+    await Promise.all(
+      Array.from({length:workerCount},(_,index) => runWorker(index))
+    );
+
+    if (firstFailure) throw firstFailure;
+    throwIfOperationCancelled();
+
+    const grid = {
+      id:autoDemId(envelope),
+      startNode:envelope.startNode,
+      endNode:envelope.endNode,
+      routeMinM:envelope.routeMinM,
+      routeMaxM:envelope.routeMaxM,
+      lateralMinM:envelope.lateralMinM,
+      lateralMaxM:envelope.lateralMaxM,
+      stepM:envelope.stepM,
+      cols:envelope.cols,
+      rows:envelope.rows,
+      values
+    };
+
+    await autoDemSaveGrid(grid);
+    const totalSeconds = (performance.now()-startedAt)/1000;
+    setCalculationOverlayState(
+      "success",
+      "Relief automatique prêt",
+      envelope.cols*envelope.rows+" altitudes mises en cache en "+autoDemFormatDuration(totalSeconds)+"."
+    );
+    byId("status").textContent = "Relief automatique prêt : la recherche radio utilisera le cache local.";
+    showToast("Relief automatique prêt en "+autoDemFormatDuration(totalSeconds)+".");
+    if (manual) {
+      await sleep(650);
+      hideCalculationOverlay();
+    }
+    return true;
+  } catch (error) {
+    if (manual) {
+      setCalculationOverlayState("error","Préparation impossible",error.message);
+      await sleep(900);
+      hideCalculationOverlay();
+    }
+    throw error;
+  } finally {
+    if (source) source.value = previousSource;
+    autoDemState.preparing = false;
+  }
+}
+</script>
+
+<script>
+"use strict";
+const sourceInput=document.getElementById("source");
+const patchButton=document.getElementById("patch");
+const statusBox=document.getElementById("status");
+let selectedFile=null;
+
+sourceInput.addEventListener("change",()=>{
+  selectedFile=sourceInput.files?.[0]||null;
+  patchButton.disabled=!selectedFile;
+  statusBox.className="status";
+  statusBox.textContent=selectedFile?"Fichier sélectionné : "+selectedFile.name:"En attente du HTML ou du ZIP source.";
+});
+
+async function readSource(file){
+  if(/\.zip$/i.test(file.name)||file.type==="application/zip"||file.type==="application/x-zip-compressed"){
+    if(typeof JSZip==="undefined")throw new Error("La bibliothèque ZIP n’a pas pu être chargée. Vérifie la connexion Internet puis recharge la page.");
+    statusBox.textContent="Ouverture du ZIP…";
+    const zip=await JSZip.loadAsync(file);
+    const candidates=Object.values(zip.files)
+      .filter(entry=>!entry.dir&&/\.html?$/i.test(entry.name))
+      .sort((a,b)=>(b._data?.uncompressedSize||0)-(a._data?.uncompressedSize||0));
+    if(!candidates.length)throw new Error("Aucun fichier HTML trouvé dans le ZIP.");
+    statusBox.textContent="Lecture de "+candidates[0].name+"…";
+    return await candidates[0].async("string");
+  }
+  return await file.text();
+}
+
+function replaceBetween(text,startMarker,endMarker,replacement,label){
+  const start=text.indexOf(startMarker);
+  if(start<0)throw new Error("Bloc introuvable : "+label+" (début).");
+  const end=text.indexOf(endMarker,start+startMarker.length);
+  if(end<0)throw new Error("Bloc introuvable : "+label+" (fin).");
+  return text.slice(0,start)+replacement+"\n\n"+text.slice(end);
+}
+
+patchButton.addEventListener("click",async()=>{
+  if(!selectedFile)return;
+  patchButton.disabled=true;
+  statusBox.className="status";
+  statusBox.textContent="Lecture et accélération du planificateur…";
+  try{
+    let html=await readSource(selectedFile);
+    if(!html.includes("RELIEF_AUTOMATIQUE_INDEXEDDB_2026_07_23")&&!html.includes("async function autoDemPrepare("))
+      throw new Error("Le fichier ne contient pas le relief automatique attendu.");
+    if(html.includes("RELIEF_TUILES_PARALLELES_2026_07_23"))
+      throw new Error("Ce fichier contient déjà l’accélération parallèle.");
+
+    const ui=document.getElementById("parallel-ui").textContent.trim();
+    const code=document.getElementById("parallel-code").textContent.trim();
+
+    const buttonMarker='<button id="localDemAutoBtn" type="button">';
+    const buttonIndex=html.indexOf(buttonMarker);
+    if(buttonIndex<0)throw new Error("Le bouton de préparation automatique est introuvable.");
+    html=html.slice(0,buttonIndex)+ui+"\n      "+html.slice(buttonIndex);
+
+    html=replaceBetween(
+      html,
+      "async function autoDemPrepare(",
+      "async function autoDemEnsureForRoute(",
+      code,
+      "moteur de préparation automatique"
+    );
+
+    const initNeedle='function autoDemInitUi() {';
+    const initIndex=html.indexOf(initNeedle);
+    if(initIndex<0)throw new Error("Initialisation du relief automatique introuvable.");
+    const insertAt=initIndex+initNeedle.length;
+    const initPatch='\n  const parallelControl = byId("localDemParallelism");\n  if (parallelControl) {\n    try {\n      const savedParallelism = localStorage.getItem("radioPlannerAutoDemParallelism");\n      if (["2","3","4","6","8"].includes(savedParallelism)) parallelControl.value = savedParallelism;\n    } catch (_) {}\n    parallelControl.addEventListener("change",() => {\n      try { localStorage.setItem("radioPlannerAutoDemParallelism",parallelControl.value); } catch (_) {}\n    });\n    protectKeyboardEditing(parallelControl);\n  }\n';
+    html=html.slice(0,insertAt)+initPatch+html.slice(insertAt);
+
+    html=html.replace("<head>","<head>\n<!-- RELIEF_TUILES_PARALLELES_2026_07_23 -->");
+    html=html.replace(/const APP_PATCH_VERSION = "[^"]+";/,'const APP_PATCH_VERSION = "relief-automatique-parallele-routeur-2026-07-23";');
+
+    const outputName="planificateur_radio_relief_automatique_accelere.html";
+    const blob=new Blob([html],{type:"text/html;charset=utf-8"});
+    const url=URL.createObjectURL(blob);
+    const link=document.createElement("a");
+    link.href=url;
+    link.download=outputName;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(()=>URL.revokeObjectURL(url),3000);
+    statusBox.className="status ok";
+    statusBox.textContent="Transformation terminée.\nFichier généré : "+outputName+"\n\nLe relief est maintenant préparé avec plusieurs lignes téléchargées simultanément. Le cache existant reste compatible.";
+  }catch(error){
+    console.error(error);
+    statusBox.className="status err";
+    statusBox.textContent="Échec : "+error.message;
+  }finally{
+    patchButton.disabled=!selectedFile;
+  }
+});
+</script>
+</body>
+</html>
