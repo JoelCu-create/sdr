@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Correcteur WMTS — recherche visible</title>
+<style>
+:root{font-family:Inter,Segoe UI,Arial,sans-serif;color-scheme:dark}*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px;background:#07111f;color:#eef4ff}.card{width:min(860px,100%);padding:28px;border:1px solid #334b6d;border-radius:16px;background:#0d1a2e;box-shadow:0 22px 70px #0008}h1{margin:0 0 10px;font-size:25px}p{color:#b9c8da;line-height:1.55}.box{margin:18px 0;padding:16px;border:1px solid #3d5577;border-radius:12px;background:#091528}input,button{width:100%;padding:12px;border:1px solid #4a6388;border-radius:9px;background:#0b1729;color:#eef4ff;font:inherit}button{margin-top:12px;background:#047857;border-color:#10b981;font-weight:800;cursor:pointer}button:disabled{opacity:.45;cursor:not-allowed}.status{min-height:80px;margin-top:14px;padding:12px;border-radius:9px;background:#081426;color:#cbd5e1;white-space:pre-wrap}.ok{color:#6ee7b7}.err{color:#fca5a5}code{color:#93c5fd}.note{font-size:13px;border-left:3px solid #38bdf8;padding-left:12px}</style>
+</head>
+<body>
+<main class="card">
+<h1>WMTS — conserver la recherche visible</h1>
+<p>Ce correcteur empêche la préparation du relief de remplacer l’affichage temps réel du routeur par la fenêtre modale floutée. Le téléchargement, la construction du cache et la propagation des rosaces restent dans la même session visuelle.</p>
+<div class="box">
+<input id="source" type="file" accept=".html,text/html">
+<button id="patch" disabled>Générer la version corrigée</button>
+<div id="status" class="status">En attente du planificateur WMTS.</div>
+</div>
+<p class="note">Fichier attendu : <code>planificateur_radio_relief_vraies_tuiles_wmts.html</code>. La préparation manuelle du relief conserve sa fenêtre normale ; seul le lancement depuis le routeur automatique reste sur la carte non floutée.</p>
+</main>
+<script>
+"use strict";
+const sourceInput=document.getElementById("source");
+const patchButton=document.getElementById("patch");
+const statusBox=document.getElementById("status");
+let selectedFile=null;
+sourceInput.addEventListener("change",()=>{
+  selectedFile=sourceInput.files?.[0]||null;
+  patchButton.disabled=!selectedFile;
+  statusBox.className="status";
+  statusBox.textContent=selectedFile?"Fichier sélectionné : "+selectedFile.name:"En attente du planificateur WMTS.";
+});
+
+const helperCode=String.raw`
+/* ===== WMTS SESSION ROUTEUR VISIBLE ===== */
+const autoDemWmtsBaseSetState = setCalculationOverlayState;
+
+function autoDemWmtsShowProgress(total,options={}) {
+  if (routerLiveSearchMode && calculationOverlayActive) {
+    const overlay = byId("calculationOverlay");
+    overlay?.classList.remove("visible","success","error");
+    overlay?.setAttribute("aria-hidden","true");
+    if (overlay) overlay.style.pointerEvents = "none";
+
+    const hud = byId("routerLiveHud");
+    hud?.classList.remove("success","error");
+    hud?.classList.add("visible");
+    hud?.setAttribute("aria-hidden","false");
+
+    calculationOverlayTotal = Math.max(1,Number(total)||1);
+    calculationOverlayCompleted = 0;
+    calculationOverlayUnitLabel = String(options.unitLabel||"étape");
+
+    const cancel = byId("routerLiveCancelBtn");
+    if (cancel) {
+      cancel.disabled = false;
+      cancel.textContent = "Annuler";
+      cancel.style.display = "";
+    }
+
+    updateCalculationOverlay(
+      0,
+      calculationOverlayTotal,
+      options.title||"Préparation du relief",
+      options.message||"Préparation…"
+    );
+    return true;
+  }
+
+  showCalculationOverlay(total,options);
+  return false;
+}
+
+function autoDemWmtsSetState(state,title,message) {
+  if (routerLiveSearchMode && state === "success") {
+    const hud = byId("routerLiveHud");
+    hud?.classList.remove("success","error");
+
+    const cancel = byId("routerLiveCancelBtn");
+    if (cancel) {
+      cancel.disabled = false;
+      cancel.textContent = "Annuler";
+      cancel.style.display = "";
+    }
+
+    updateCalculationOverlay(
+      calculationOverlayCompleted,
+      calculationOverlayTotal,
+      title||"Relief local prêt",
+      (message||"Relief local prêt.")+" Démarrage de la recherche par rosaces…"
+    );
+    return;
+  }
+
+  autoDemWmtsBaseSetState(state,title,message);
+}
+/* ===== FIN WMTS SESSION ROUTEUR VISIBLE ===== */
+`;
+
+patchButton.addEventListener("click",async()=>{
+  if(!selectedFile)return;
+  patchButton.disabled=true;
+  statusBox.className="status";
+  statusBox.textContent="Lecture et correction de la session visuelle…";
+  try{
+    let html=await selectedFile.text();
+    if(!html.includes("VRAIES_TUILES_WMTS_BIL_2026_07_23")&&!html.includes("AUTO_DEM_WMTS_LAYER"))
+      throw new Error("Le moteur par vraies tuiles WMTS est introuvable.");
+    if(html.includes("WMTS_SESSION_ROUTEUR_VISIBLE_2026_07_23"))
+      throw new Error("Ce fichier contient déjà cette correction.");
+
+    const start=html.indexOf("/* ===== VRAIES TUILES WMTS");
+    const end=html.indexOf("async function autoDemEnsureForRoute(",start);
+    if(start<0||end<0)throw new Error("Le bloc WMTS complet est introuvable.");
+
+    let block=html.slice(start,end);
+    const downloadNeedle="async function autoDemWmtsDownloadTiles(bounds) {";
+    if(!block.includes(downloadNeedle))throw new Error("Le téléchargement WMTS est introuvable.");
+    block=block.replace(downloadNeedle,helperCode+"\n\n"+downloadNeedle);
+
+    block=block.split("showCalculationOverlay(jobs.length,{").join("autoDemWmtsShowProgress(jobs.length,{");
+    block=block.split("showCalculationOverlay(envelope.rows,{").join("autoDemWmtsShowProgress(envelope.rows,{");
+
+    if(!block.includes("function autoDemWmtsBuildGrid(envelope,bounds,tiles)"))
+      throw new Error("La construction de la grille WMTS est introuvable.");
+    block=block.replace(
+      "function autoDemWmtsBuildGrid(envelope,bounds,tiles)",
+      "async function autoDemWmtsBuildGrid(envelope,bounds,tiles)"
+    );
+    block=block.replace(
+      "const values = autoDemWmtsBuildGrid(envelope,bounds,tiles);",
+      "const values = await autoDemWmtsBuildGrid(envelope,bounds,tiles);"
+    );
+
+    const paintNeedle='        "Interpolation locale depuis les tuiles · ligne "+(row+1)+"/"+envelope.rows+"."\n      );\n    }';
+    const paintReplacement='        "Interpolation locale depuis les tuiles · ligne "+(row+1)+"/"+envelope.rows+"."\n      );\n      await waitForUiPaint();\n    }';
+    if(block.includes(paintNeedle))block=block.replace(paintNeedle,paintReplacement);
+
+    block=block.split("setCalculationOverlayState(").join("autoDemWmtsSetState(");
+
+    html=html.slice(0,start)+block+html.slice(end);
+    html=html.replace("<head>","<head>\n<!-- WMTS_SESSION_ROUTEUR_VISIBLE_2026_07_23 -->");
+    html=html.replace(/const APP_PATCH_VERSION = "[^"]+";/,'const APP_PATCH_VERSION = "wmts-session-routeur-visible-2026-07-23";');
+
+    const outputName="planificateur_radio_relief_wmts_session_visible.html";
+    const blob=new Blob([html],{type:"text/html;charset=utf-8"});
+    const url=URL.createObjectURL(blob);
+    const link=document.createElement("a");
+    link.href=url;
+    link.download=outputName;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(()=>URL.revokeObjectURL(url),3000);
+
+    statusBox.className="status ok";
+    statusBox.textContent="Correction terminée.\nFichier généré : "+outputName+"\n\nLe téléchargement des tuiles, l’interpolation du cache et la recherche par rosaces restent désormais sur la carte non floutée quand ils sont lancés par le routeur automatique.";
+  }catch(error){
+    console.error(error);
+    statusBox.className="status err";
+    statusBox.textContent="Échec : "+error.message;
+  }finally{
+    patchButton.disabled=!selectedFile;
+  }
+});
+</script>
+</body>
+</html>
