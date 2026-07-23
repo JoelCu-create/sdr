@@ -1,0 +1,510 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Intégrateur vraies tuiles WMTS du relief</title>
+<script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+<style>
+:root{font-family:Inter,Segoe UI,Arial,sans-serif;color-scheme:dark}*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px;background:#07111f;color:#eef4ff}.card{width:min(900px,100%);padding:28px;border:1px solid #334b6d;border-radius:16px;background:#0d1a2e;box-shadow:0 22px 70px #0008}h1{margin:0 0 10px;font-size:25px}p{color:#b9c8da;line-height:1.55}.box{margin:18px 0;padding:16px;border:1px solid #3d5577;border-radius:12px;background:#091528}input,button{width:100%;padding:12px;border:1px solid #4a6388;border-radius:9px;background:#0b1729;color:#eef4ff;font:inherit}button{margin-top:12px;background:#047857;border-color:#10b981;font-weight:800;cursor:pointer}button:disabled{opacity:.45;cursor:not-allowed}.status{min-height:80px;margin-top:14px;padding:12px;border-radius:9px;background:#081426;color:#cbd5e1;white-space:pre-wrap}.ok{color:#6ee7b7}.err{color:#fca5a5}code{color:#93c5fd}.note{font-size:13px;border-left:3px solid #38bdf8;padding-left:12px}.steps{margin:12px 0;color:#cbd5e1;line-height:1.55}
+</style>
+</head>
+<body>
+<main class="card">
+<h1>Relief automatique — vraies tuiles WMTS</h1>
+<p>Cette étape remplace la préparation par profils IGN, même parallèles, par le téléchargement de tuiles binaires d’altitude. Les tuiles sont décodées localement, puis le cache de zone existant est alimenté sans requête ligne par ligne.</p>
+<div class="box">
+<input id="source" type="file" accept=".zip,.html,text/html,application/zip">
+<button id="patch" disabled>Générer la version par vraies tuiles</button>
+<div id="status" class="status">En attente du HTML ou du ZIP contenant la version avec relief automatique.</div>
+</div>
+<div class="steps">
+Fichier conseillé : <code>planificateur_radio_relief_automatique_accelere_corrige.html</code>.<br>
+Les versions automatiques antérieures sont aussi acceptées si elles contiennent <code>autoDemPrepare</code>.
+</div>
+<p class="note">En cas d’échec du service WMTS ou d’une couverture incomplète, le programme conserve automatiquement l’ancienne préparation par profils comme secours. Le fonctionnement normal utilise les tuiles.</p>
+</main>
+
+<script type="text/plain" id="wmts-ui">
+      <label>Tuiles de relief WMTS
+        <select id="localDemWmtsZoom">
+          <option value="0" selected>Automatique selon la précision</option>
+          <option value="10">Niveau 10 — environ 75 m/pixel</option>
+          <option value="11">Niveau 11 — environ 38 m/pixel</option>
+          <option value="12">Niveau 12 — environ 19 m/pixel</option>
+          <option value="13">Niveau 13 — environ 10 m/pixel</option>
+        </select>
+      </label>
+      <label>Téléchargements de tuiles simultanés
+        <select id="localDemWmtsParallelism">
+          <option value="2">2 — prudent</option>
+          <option value="3">3 — équilibré</option>
+          <option value="4" selected>4 — recommandé</option>
+          <option value="6">6 — rapide</option>
+        </select>
+      </label>
+</script>
+
+<script type="text/plain" id="wmts-code">
+/* ===== VRAIES TUILES WMTS BIL 32 BITS ===== */
+const AUTO_DEM_WMTS_LAYER = "ELEVATION.ELEVATIONGRIDCOVERAGE.HIGHRES";
+const AUTO_DEM_WMTS_MATRIX_SET = "WGS84G";
+const AUTO_DEM_WMTS_TILE_SIZE = 256;
+const AUTO_DEM_WMTS_NODATA = -99999;
+const AUTO_DEM_WMTS_MAX_TILES = 650;
+
+function autoDemWmtsSleep(ms) {
+  return new Promise(resolve => setTimeout(resolve,ms));
+}
+
+function autoDemWmtsZoom(settings) {
+  const selected = Number(byId("localDemWmtsZoom")?.value);
+  if (Number.isFinite(selected) && selected >= 10 && selected <= 13) return selected;
+  if (settings.precisionKey === "detailed") return 12;
+  if (settings.precisionKey === "quick") return 10;
+  return 11;
+}
+
+function autoDemWmtsParallelism() {
+  const selected = Number(byId("localDemWmtsParallelism")?.value);
+  if (Number.isFinite(selected)) return Math.max(1,Math.min(6,Math.round(selected)));
+  return 4;
+}
+
+function autoDemWmtsMatrixDimensions(zoom) {
+  return {
+    width:Math.pow(2,zoom+1),
+    height:Math.pow(2,zoom)
+  };
+}
+
+function autoDemWmtsLonToTileColumn(lon,zoom) {
+  const matrix = autoDemWmtsMatrixDimensions(zoom);
+  return Math.floor((Math.max(-180,Math.min(179.999999999,lon))+180)/360*matrix.width);
+}
+
+function autoDemWmtsLatToTileRow(lat,zoom) {
+  const matrix = autoDemWmtsMatrixDimensions(zoom);
+  return Math.floor((90-Math.max(-89.999999999,Math.min(89.999999999,lat)))/180*matrix.height);
+}
+
+function autoDemWmtsTileKey(column,row) {
+  return column+"/"+row;
+}
+
+function autoDemWmtsBoundsForEnvelope(envelope,zoom) {
+  const corners = [
+    envelope.frame.toLatLon(envelope.routeMinM,envelope.lateralMinM),
+    envelope.frame.toLatLon(envelope.routeMinM,envelope.lateralMaxM),
+    envelope.frame.toLatLon(envelope.routeMaxM,envelope.lateralMinM),
+    envelope.frame.toLatLon(envelope.routeMaxM,envelope.lateralMaxM)
+  ];
+  const lats = corners.map(point => point.lat);
+  const lons = corners.map(point => point.lon);
+  const matrix = autoDemWmtsMatrixDimensions(zoom);
+  const minLon = Math.min(...lons);
+  const maxLon = Math.max(...lons);
+  const minLat = Math.min(...lats);
+  const maxLat = Math.max(...lats);
+  return {
+    zoom,
+    minColumn:Math.max(0,autoDemWmtsLonToTileColumn(minLon,zoom)-1),
+    maxColumn:Math.min(matrix.width-1,autoDemWmtsLonToTileColumn(maxLon,zoom)+1),
+    minRow:Math.max(0,autoDemWmtsLatToTileRow(maxLat,zoom)-1),
+    maxRow:Math.min(matrix.height-1,autoDemWmtsLatToTileRow(minLat,zoom)+1)
+  };
+}
+
+function autoDemWmtsTileCount(bounds) {
+  return (bounds.maxColumn-bounds.minColumn+1)*(bounds.maxRow-bounds.minRow+1);
+}
+
+function autoDemWmtsChooseBounds(envelope,settings) {
+  let zoom = autoDemWmtsZoom(settings);
+  let bounds = autoDemWmtsBoundsForEnvelope(envelope,zoom);
+  while (zoom > 9 && autoDemWmtsTileCount(bounds) > AUTO_DEM_WMTS_MAX_TILES) {
+    zoom--;
+    bounds = autoDemWmtsBoundsForEnvelope(envelope,zoom);
+  }
+  return bounds;
+}
+
+function autoDemWmtsTileUrl(zoom,row,column) {
+  const params = new URLSearchParams({
+    SERVICE:"WMTS",
+    VERSION:"1.0.0",
+    REQUEST:"GetTile",
+    LAYER:AUTO_DEM_WMTS_LAYER,
+    STYLE:"normal",
+    TILEMATRIXSET:AUTO_DEM_WMTS_MATRIX_SET,
+    TILEMATRIX:String(zoom),
+    TILEROW:String(row),
+    TILECOL:String(column),
+    FORMAT:"image/x-bil;bits=32"
+  });
+  return "https://data.geopf.fr/wmts?"+params.toString();
+}
+
+function autoDemWmtsDecodeBil(buffer,row,column) {
+  const expectedBytes = AUTO_DEM_WMTS_TILE_SIZE*AUTO_DEM_WMTS_TILE_SIZE*4;
+  if (!(buffer instanceof ArrayBuffer) || buffer.byteLength !== expectedBytes) {
+    throw new Error("Tuile WMTS invalide "+column+"/"+row+" : "+(buffer?.byteLength||0)+" octets au lieu de "+expectedBytes+".");
+  }
+  const view = new DataView(buffer);
+  const values = new Float32Array(AUTO_DEM_WMTS_TILE_SIZE*AUTO_DEM_WMTS_TILE_SIZE);
+  let plausible = 0;
+  for (let index=0; index<values.length; index++) {
+    const value = view.getFloat32(index*4,true);
+    values[index] = value;
+    if ((Number.isFinite(value) && value > -1000 && value < 10000) || value <= -99000) plausible++;
+  }
+  if (plausible < values.length*.7) {
+    throw new Error("Encodage BIL inattendu pour la tuile "+column+"/"+row+".");
+  }
+  return values;
+}
+
+async function autoDemWmtsFetchTile(zoom,row,column) {
+  const url = autoDemWmtsTileUrl(zoom,row,column);
+  let lastError = null;
+  for (let attempt=1; attempt<=5; attempt++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(),30000);
+    try {
+      const response = await fetch(url,{signal:controller.signal,cache:"force-cache"});
+      if (!response.ok) {
+        if (response.status === 429 || response.status >= 500) {
+          const retryAfter = Number(response.headers.get("Retry-After"));
+          await autoDemWmtsSleep(Number.isFinite(retryAfter) ? retryAfter*1000 : 900*attempt);
+          continue;
+        }
+        throw new Error("HTTP "+response.status+" sur une tuile WMTS.");
+      }
+      const buffer = await response.arrayBuffer();
+      return autoDemWmtsDecodeBil(buffer,row,column);
+    } catch (error) {
+      lastError = error;
+      if (error?.name === "AbortError") lastError = new Error("Délai dépassé sur une tuile WMTS.");
+      if (attempt < 5) await autoDemWmtsSleep(700*attempt);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  throw lastError || new Error("Téléchargement WMTS impossible.");
+}
+
+async function autoDemWmtsDownloadTiles(bounds) {
+  const jobs = [];
+  for (let row=bounds.minRow; row<=bounds.maxRow; row++) {
+    for (let column=bounds.minColumn; column<=bounds.maxColumn; column++) {
+      jobs.push({row,column});
+    }
+  }
+  const tiles = new Map();
+  const concurrency = Math.min(autoDemWmtsParallelism(),jobs.length || 1);
+  let nextIndex = 0;
+  let completed = 0;
+  let firstFailure = null;
+  const startedAt = performance.now();
+
+  showCalculationOverlay(jobs.length,{
+    title:"Téléchargement des tuiles de relief",
+    message:jobs.length+" vraies tuiles WMTS · niveau "+bounds.zoom+" · "+concurrency+" flux.",
+    unitLabel:"tuile"
+  });
+
+  const worker = async () => {
+    while (true) {
+      throwIfOperationCancelled();
+      if (firstFailure) return;
+      const index = nextIndex++;
+      if (index >= jobs.length) return;
+      const job = jobs[index];
+      try {
+        const values = await autoDemWmtsFetchTile(bounds.zoom,job.row,job.column);
+        tiles.set(autoDemWmtsTileKey(job.column,job.row),values);
+        completed++;
+        const elapsed = Math.max(.1,(performance.now()-startedAt)/1000);
+        const remaining = completed ? Math.round((jobs.length-completed)/(completed/elapsed)) : 0;
+        updateCalculationOverlay(
+          completed,
+          jobs.length,
+          "Téléchargement des tuiles de relief",
+          completed+"/"+jobs.length+" tuiles · niveau "+bounds.zoom+" · reste estimé "+remaining+" s."
+        );
+        if (completed%concurrency === 0) await waitForUiPaint();
+      } catch (error) {
+        firstFailure = error;
+        return;
+      }
+    }
+  };
+
+  await Promise.all(Array.from({length:concurrency},() => worker()));
+  if (firstFailure) throw firstFailure;
+  throwIfOperationCancelled();
+  return tiles;
+}
+
+function autoDemWmtsPixelValue(tiles,zoom,pixelX,pixelY) {
+  const matrix = autoDemWmtsMatrixDimensions(zoom);
+  const worldWidth = matrix.width*AUTO_DEM_WMTS_TILE_SIZE;
+  const worldHeight = matrix.height*AUTO_DEM_WMTS_TILE_SIZE;
+  const x = Math.max(0,Math.min(worldWidth-1,pixelX));
+  const y = Math.max(0,Math.min(worldHeight-1,pixelY));
+  const column = Math.floor(x/AUTO_DEM_WMTS_TILE_SIZE);
+  const row = Math.floor(y/AUTO_DEM_WMTS_TILE_SIZE);
+  const localX = Math.floor(x-column*AUTO_DEM_WMTS_TILE_SIZE);
+  const localY = Math.floor(y-row*AUTO_DEM_WMTS_TILE_SIZE);
+  const tile = tiles.get(autoDemWmtsTileKey(column,row));
+  if (!tile) return NaN;
+  const value = tile[localY*AUTO_DEM_WMTS_TILE_SIZE+localX];
+  if (!Number.isFinite(value) || value <= -99000) return NaN;
+  return value;
+}
+
+function autoDemWmtsSample(tiles,zoom,lat,lon) {
+  const matrix = autoDemWmtsMatrixDimensions(zoom);
+  const globalX = (Math.max(-180,Math.min(180,lon))+180)/360*matrix.width*AUTO_DEM_WMTS_TILE_SIZE-.5;
+  const globalY = (90-Math.max(-90,Math.min(90,lat)))/180*matrix.height*AUTO_DEM_WMTS_TILE_SIZE-.5;
+  const x0 = Math.floor(globalX);
+  const y0 = Math.floor(globalY);
+  const fx = globalX-x0;
+  const fy = globalY-y0;
+  const samples = [
+    [x0,y0,(1-fx)*(1-fy)],
+    [x0+1,y0,fx*(1-fy)],
+    [x0,y0+1,(1-fx)*fy],
+    [x0+1,y0+1,fx*fy]
+  ];
+  let weighted = 0;
+  let weight = 0;
+  for (const sample of samples) {
+    const value = autoDemWmtsPixelValue(tiles,zoom,sample[0],sample[1]);
+    if (!Number.isFinite(value)) continue;
+    weighted += value*sample[2];
+    weight += sample[2];
+  }
+  if (weight <= 0) throw new Error("Altitude absente des tuiles WMTS pour un point de la zone.");
+  return weighted/weight;
+}
+
+function autoDemWmtsBuildGrid(envelope,bounds,tiles) {
+  const values = new Float32Array(envelope.cols*envelope.rows);
+  for (let row=0; row<envelope.rows; row++) {
+    const lateralFraction = envelope.rows === 1 ? 0 : row/(envelope.rows-1);
+    const lateralM = envelope.lateralMinM+(envelope.lateralMaxM-envelope.lateralMinM)*lateralFraction;
+    for (let column=0; column<envelope.cols; column++) {
+      const routeFraction = envelope.cols === 1 ? 0 : column/(envelope.cols-1);
+      const routeM = envelope.routeMinM+(envelope.routeMaxM-envelope.routeMinM)*routeFraction;
+      const point = envelope.frame.toLatLon(routeM,lateralM);
+      values[row*envelope.cols+column] = autoDemWmtsSample(tiles,bounds.zoom,point.lat,point.lon);
+    }
+    if (row%12 === 0) {
+      updateCalculationOverlay(
+        row,
+        envelope.rows,
+        "Construction du cache local",
+        "Interpolation locale depuis les tuiles · ligne "+(row+1)+"/"+envelope.rows+"."
+      );
+    }
+  }
+  return values;
+}
+
+function autoDemWmtsInitUi() {
+  const zoom = byId("localDemWmtsZoom");
+  const parallel = byId("localDemWmtsParallelism");
+  try {
+    const savedZoom = localStorage.getItem("radioPlannerAutoDemWmtsZoom");
+    if (["0","10","11","12","13"].includes(savedZoom) && zoom) zoom.value = savedZoom;
+    const savedParallel = localStorage.getItem("radioPlannerAutoDemWmtsParallelism");
+    if (["2","3","4","6"].includes(savedParallel) && parallel) parallel.value = savedParallel;
+  } catch (_) {}
+  zoom?.addEventListener("change",() => {
+    try { localStorage.setItem("radioPlannerAutoDemWmtsZoom",zoom.value); } catch (_) {}
+  });
+  parallel?.addEventListener("change",() => {
+    try { localStorage.setItem("radioPlannerAutoDemWmtsParallelism",parallel.value); } catch (_) {}
+  });
+  if (zoom) protectKeyboardEditing(zoom);
+  if (parallel) protectKeyboardEditing(parallel);
+}
+
+if (document.readyState === "loading") {
+  document.addEventListener("DOMContentLoaded",autoDemWmtsInitUi,{once:true});
+} else {
+  setTimeout(autoDemWmtsInitUi,0);
+}
+
+async function autoDemPrepare(routeState,settings,{force=false,manual=false}={}) {
+  await autoDemReady();
+  if (autoDemState.preparing) throw new Error("Une préparation du relief est déjà en cours.");
+  if (!routeState?.valid) throw new Error("Affecte exactement un départ et une arrivée.");
+  if (localDemState.tiles.length && !force) {
+    autoDemRefreshInfo("Dalles ASC manuelles déjà disponibles");
+    return true;
+  }
+
+  const envelope = autoDemBuildEnvelope(routeState,settings);
+  const existing = autoDemFindGridForEnvelope(envelope);
+  if (existing && !force) {
+    autoDemState.grids = [existing,...autoDemState.grids.filter(grid => grid !== existing)];
+    autoDemRefreshInfo("La zone demandée est déjà couverte");
+    localDemUpdateSummary();
+    return true;
+  }
+
+  const sourceControl = byId("terrainSource");
+  const originalSource = sourceControl?.value || "auto";
+  autoDemState.preparing = true;
+  operationCancelled = false;
+
+  try {
+    const bounds = autoDemWmtsChooseBounds(envelope,settings);
+    const tileCount = autoDemWmtsTileCount(bounds);
+    autoDemRefreshInfo("Préparation par "+tileCount+" tuiles WMTS");
+    const tiles = await autoDemWmtsDownloadTiles(bounds);
+
+    showCalculationOverlay(envelope.rows,{
+      title:"Construction du cache local",
+      message:tiles.size+" tuiles téléchargées · interpolation de "+(envelope.cols*envelope.rows)+" altitudes.",
+      unitLabel:"ligne"
+    });
+
+    const values = autoDemWmtsBuildGrid(envelope,bounds,tiles);
+    const grid = {
+      id:autoDemId(envelope)+"|wmts:"+bounds.zoom,
+      startNode:envelope.startNode,
+      endNode:envelope.endNode,
+      routeMinM:envelope.routeMinM,
+      routeMaxM:envelope.routeMaxM,
+      lateralMinM:envelope.lateralMinM,
+      lateralMaxM:envelope.lateralMaxM,
+      stepM:envelope.stepM,
+      cols:envelope.cols,
+      rows:envelope.rows,
+      values,
+      source:"WMTS BIL RGE ALTI",
+      wmtsZoom:bounds.zoom,
+      wmtsTileCount:tiles.size
+    };
+
+    await autoDemSaveGrid(grid);
+    setCalculationOverlayState(
+      "success",
+      "Relief local prêt",
+      tiles.size+" tuiles WMTS téléchargées puis "+(envelope.cols*envelope.rows)+" altitudes mises en cache."
+    );
+    byId("status").textContent = "Relief local prêt : les calculs utiliseront le cache construit depuis les tuiles WMTS.";
+    showToast("Relief prêt depuis "+tiles.size+" tuiles WMTS.");
+    if (manual) {
+      await sleep(700);
+      hideCalculationOverlay();
+    }
+    return true;
+  } catch (error) {
+    console.warn("Préparation WMTS impossible",error);
+    autoDemState.preparing = false;
+    if (originalSource === "local") {
+      if (manual) {
+        setCalculationOverlayState("error","Tuiles WMTS indisponibles",error.message);
+        await sleep(1000);
+        hideCalculationOverlay();
+      }
+      throw error;
+    }
+    autoDemRefreshInfo("Tuiles indisponibles : secours par profils IGN");
+    if (manual) hideCalculationOverlay();
+    return await autoDemPrepareLinesLegacy(routeState,settings,{force,manual});
+  } finally {
+    if (sourceControl) sourceControl.value = originalSource;
+    autoDemState.preparing = false;
+  }
+}
+/* ===== FIN VRAIES TUILES WMTS ===== */
+</script>
+
+<script>
+"use strict";
+const sourceInput=document.getElementById("source");
+const patchButton=document.getElementById("patch");
+const statusBox=document.getElementById("status");
+let selectedFile=null;
+
+sourceInput.addEventListener("change",()=>{
+  selectedFile=sourceInput.files?.[0]||null;
+  patchButton.disabled=!selectedFile;
+  statusBox.className="status";
+  statusBox.textContent=selectedFile?"Fichier sélectionné : "+selectedFile.name:"En attente du HTML ou du ZIP source.";
+});
+
+async function readSource(file){
+  if(/\.zip$/i.test(file.name)||file.type==="application/zip"||file.type==="application/x-zip-compressed"){
+    if(typeof JSZip==="undefined")throw new Error("La bibliothèque ZIP n’a pas pu être chargée. Vérifie la connexion Internet puis recharge la page.");
+    statusBox.textContent="Ouverture du ZIP…";
+    const zip=await JSZip.loadAsync(file);
+    const candidates=Object.values(zip.files)
+      .filter(entry=>!entry.dir&&/\.html?$/i.test(entry.name))
+      .sort((a,b)=>(b._data?.uncompressedSize||0)-(a._data?.uncompressedSize||0));
+    if(!candidates.length)throw new Error("Aucun fichier HTML trouvé dans le ZIP.");
+    statusBox.textContent="Lecture de "+candidates[0].name+"…";
+    return await candidates[0].async("string");
+  }
+  return await file.text();
+}
+
+patchButton.addEventListener("click",async()=>{
+  if(!selectedFile)return;
+  patchButton.disabled=true;
+  statusBox.className="status";
+  statusBox.textContent="Lecture et intégration des vraies tuiles WMTS…";
+  try{
+    let html=await readSource(selectedFile);
+    if(!html.includes("async function autoDemPrepare("))
+      throw new Error("La fonction autoDemPrepare est introuvable. Sélectionne la version contenant le relief automatique.");
+    if(!html.includes("autoDemBuildEnvelope")||!html.includes("autoDemSaveGrid"))
+      throw new Error("Le moteur de cache automatique attendu est incomplet.");
+    if(html.includes("VRAIES_TUILES_WMTS_BIL_2026_07_23"))
+      throw new Error("Ce fichier contient déjà le moteur par tuiles WMTS.");
+
+    const start=html.indexOf("async function autoDemPrepare(");
+    const end=html.indexOf("async function autoDemEnsureForRoute(",start);
+    if(end<0)throw new Error("La fin de la préparation automatique est introuvable.");
+    const originalBlock=html.slice(start,end);
+    const legacyBlock=originalBlock.replace("async function autoDemPrepare(","async function autoDemPrepareLinesLegacy(");
+    const wmtsCode=document.getElementById("wmts-code").textContent.trim();
+    html=html.slice(0,start)+wmtsCode+"\n\n"+legacyBlock+html.slice(end);
+
+    const ui=document.getElementById("wmts-ui").textContent.trim();
+    const buttonMarker='<button id="localDemAutoBtn" type="button">';
+    const buttonIndex=html.indexOf(buttonMarker);
+    if(buttonIndex<0)throw new Error("Le bouton de préparation automatique est introuvable.");
+    html=html.slice(0,buttonIndex)+ui+"\n      "+html.slice(buttonIndex);
+
+    html=html.replace("<head>","<head>\n<!-- VRAIES_TUILES_WMTS_BIL_2026_07_23 -->");
+    html=html.replace(/const APP_PATCH_VERSION = "[^"]+";/,'const APP_PATCH_VERSION = "relief-vraies-tuiles-wmts-bil-2026-07-23";');
+
+    const outputName="planificateur_radio_relief_vraies_tuiles_wmts.html";
+    const blob=new Blob([html],{type:"text/html;charset=utf-8"});
+    const url=URL.createObjectURL(blob);
+    const link=document.createElement("a");
+    link.href=url;
+    link.download=outputName;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(()=>URL.revokeObjectURL(url),3000);
+    statusBox.className="status ok";
+    statusBox.textContent="Transformation terminée.\nFichier généré : "+outputName+"\n\nLa première préparation télécharge maintenant de vraies tuiles WMTS BIL, puis construit le cache local. L’ancienne méthode par lignes reste uniquement comme secours.";
+  }catch(error){
+    console.error(error);
+    statusBox.className="status err";
+    statusBox.textContent="Échec : "+error.message;
+  }finally{
+    patchButton.disabled=!selectedFile;
+  }
+});
+</script>
+</body>
+</html>
