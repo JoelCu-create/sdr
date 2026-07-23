@@ -1,0 +1,564 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Générateur du planificateur avec relief local</title>
+<style>
+:root{font-family:Inter,Segoe UI,Arial,sans-serif;color-scheme:dark}*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px;background:#07111f;color:#eef4ff}.card{width:min(820px,100%);padding:28px;border:1px solid #334b6d;border-radius:16px;background:#0d1a2e;box-shadow:0 22px 70px #0008}h1{margin:0 0 10px;font-size:25px}p{color:#b9c8da;line-height:1.55}.box{margin:18px 0;padding:16px;border:1px solid #3d5577;border-radius:12px;background:#091528}input,button{width:100%;padding:12px;border:1px solid #4a6388;border-radius:9px;background:#0b1729;color:#eef4ff;font:inherit}button{margin-top:12px;background:#047857;border-color:#10b981;font-weight:800;cursor:pointer}button:disabled{opacity:.45;cursor:not-allowed}.status{min-height:62px;margin-top:14px;padding:12px;border-radius:9px;background:#081426;color:#cbd5e1;white-space:pre-wrap}.ok{color:#6ee7b7}.err{color:#fca5a5}code{color:#93c5fd}.note{font-size:13px;border-left:3px solid #38bdf8;padding-left:12px}
+</style>
+</head>
+<body>
+<main class="card">
+<h1>Planificateur radio — relief local</h1>
+<p>Ce générateur transforme la dernière version du planificateur en une version hybride : calcul local avec les dalles <b>BD ALTI / RGE ALTI au format ASC Lambert-93</b>, avec retour automatique vers l’IGN lorsque la couverture locale est incomplète.</p>
+<div class="box">
+<input id="source" type="file" accept=".html,text/html">
+<button id="patch" disabled>Générer le planificateur complet</button>
+<div id="status" class="status">En attente du fichier source.</div>
+</div>
+<p class="note">Choisis <code>planificateur_radio_routeur_progressif_rosaces_visibles.html</code>. Le fichier n’est pas envoyé sur Internet : la transformation est faite dans Chrome, sur ton ordinateur.</p>
+</main>
+<script>
+"use strict";
+const sourceInput=document.getElementById("source");
+const patchButton=document.getElementById("patch");
+const statusBox=document.getElementById("status");
+let selectedFile=null;
+sourceInput.addEventListener("change",()=>{
+ selectedFile=sourceInput.files?.[0]||null;
+ patchButton.disabled=!selectedFile;
+ statusBox.className="status";
+ statusBox.textContent=selectedFile?"Fichier sélectionné : "+selectedFile.name:"En attente du fichier source.";
+});
+function requiredReplace(text,search,replacement,label){
+ if(typeof search==="string"){
+  if(!text.includes(search))throw new Error("Bloc introuvable : "+label+". Utilise bien la dernière version du planificateur.");
+  return text.replace(search,replacement);
+ }
+ if(!search.test(text))throw new Error("Bloc introuvable : "+label+". Utilise bien la dernière version du planificateur.");
+ search.lastIndex=0;
+ return text.replace(search,replacement);
+}
+const demCss=String.raw`
+<style id="local-dem-css">
+#localTerrainPanel .localDemButtons{display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-top:8px}
+#localTerrainPanel .localDemButtons button{min-height:42px}
+#localTerrainPanel .localDemStatus{margin-top:9px;padding:9px;border:1px solid #315071;border-radius:8px;background:#081426;line-height:1.45}
+#localTerrainPanel .localDemStatus.ready{border-color:#047857;color:#a7f3d0}
+#localTerrainPanel .localDemStatus.error{border-color:#991b1b;color:#fecaca}
+#localTerrainPanel .localDemBadge{display:inline-block;margin-left:5px;padding:1px 6px;border:1px solid #0ea5e9;border-radius:999px;color:#7dd3fc;font-size:9px;vertical-align:2px}
+</style>`;
+const demPanel=String.raw`
+  <section class="panel" id="localTerrainPanel">
+    <h2>Relief local <span class="localDemBadge">ACCÉLÉRÉ</span></h2>
+    <label>Source des altitudes
+      <select id="terrainSource">
+        <option value="auto" selected>Automatique — local puis IGN</option>
+        <option value="local">Local uniquement</option>
+        <option value="ign">IGN uniquement</option>
+      </select>
+    </label>
+    <div class="localDemButtons">
+      <button id="localDemFolderBtn" type="button" class="secondary">Charger un dossier ASC</button>
+      <button id="localDemFilesBtn" type="button" class="secondary">Choisir des dalles ASC</button>
+    </div>
+    <button id="localDemClearBtn" type="button" class="secondary" style="margin-top:7px">Vider le relief local</button>
+    <input id="localDemFolderInput" type="file" accept=".asc,.txt" multiple webkitdirectory directory hidden>
+    <input id="localDemFilesInput" type="file" accept=".asc,.txt" multiple hidden>
+    <div id="localDemStatus" class="localDemStatus small">Aucune dalle chargée. Format attendu : ESRI ASCII Grid en Lambert-93.</div>
+    <p class="small" style="margin-bottom:0">
+      Les en-têtes des dalles sont indexés immédiatement. Les altitudes complètes sont chargées à la demande et un cache mémoire limité évite de saturer le PC. Il faut resélectionner le dossier après chaque redémarrage de l’application.
+    </p>
+  </section>
+`;
+const demCode=String.raw`
+/* ===== RELIEF LOCAL ASC LAMBERT-93 ===== */
+const localDemState = {
+  tiles:[],
+  version:0,
+  maxLoadedTiles:6,
+  indexing:false
+};
+
+function localDemMode() {
+  const value = byId("terrainSource")?.value;
+  return ["auto","local","ign"].includes(value) ? value : "auto";
+}
+
+function localDemSetStatus(message,state="") {
+  const target = byId("localDemStatus");
+  if (!target) return;
+  target.textContent = message;
+  target.classList.remove("ready","error");
+  if (state) target.classList.add(state);
+}
+
+function localDemClear() {
+  localDemState.tiles.forEach(tile => { tile.values = null; });
+  localDemState.tiles = [];
+  localDemState.version++;
+  terrainCache.clear();
+  localDemSetStatus("Aucune dalle chargée. Format attendu : ESRI ASCII Grid en Lambert-93.");
+}
+
+function localDemRecognizedHeaderKey(key) {
+  return [
+    "ncols","nrows","xllcorner","yllcorner",
+    "xllcenter","yllcenter","cellsize","nodata_value"
+  ].includes(String(key).toLowerCase());
+}
+
+async function localDemReadHeader(file) {
+  const preview = await file.slice(0,16384).text();
+  const lines = preview.split(/\r?\n/);
+  const header = {};
+  let headerLines = 0;
+
+  for (let index=0; index<Math.min(lines.length,30); index++) {
+    const line = lines[index].trim();
+    if (!line) {
+      headerLines = index+1;
+      continue;
+    }
+    const match = line.match(/^([A-Za-z_]+)\s+(.+)$/);
+    if (!match || !localDemRecognizedHeaderKey(match[1])) {
+      if (Object.keys(header).length >= 5) {
+        headerLines = index;
+        break;
+      }
+      continue;
+    }
+    header[match[1].toLowerCase()] = Number(String(match[2]).trim().replace(",","."));
+    headerLines = index+1;
+  }
+
+  const ncols = Math.round(header.ncols);
+  const nrows = Math.round(header.nrows);
+  const cellsize = Number(header.cellsize);
+  const xReference = Number.isFinite(header.xllcorner) ? header.xllcorner : header.xllcenter;
+  const yReference = Number.isFinite(header.yllcorner) ? header.yllcorner : header.yllcenter;
+
+  if (!(ncols>0) || !(nrows>0) || !(cellsize>0) || !Number.isFinite(xReference) || !Number.isFinite(yReference)) {
+    throw new Error("En-tête ASC incomplet dans "+file.name);
+  }
+
+  const xMin = Number.isFinite(header.xllcorner) ? xReference : xReference-cellsize/2;
+  const yMin = Number.isFinite(header.yllcorner) ? yReference : yReference-cellsize/2;
+
+  return {
+    id:file.name+":"+file.size+":"+file.lastModified,
+    file,
+    name:file.name,
+    ncols,
+    nrows,
+    cellsize,
+    xMin,
+    yMin,
+    xMax:xMin+ncols*cellsize,
+    yMax:yMin+nrows*cellsize,
+    nodata:Number.isFinite(header.nodata_value) ? header.nodata_value : -9999,
+    headerLines,
+    values:null,
+    lastUse:0
+  };
+}
+
+function localDemTouch(tile) {
+  tile.lastUse = performance.now();
+}
+
+function localDemEvict(exceptTile=null) {
+  const loaded = localDemState.tiles
+    .filter(tile => tile.values && tile !== exceptTile)
+    .sort((a,b) => a.lastUse-b.lastUse);
+  while (localDemState.tiles.filter(tile => tile.values).length > localDemState.maxLoadedTiles && loaded.length) {
+    loaded.shift().values = null;
+  }
+}
+
+async function localDemLoadTile(tile) {
+  if (tile.values) {
+    localDemTouch(tile);
+    return tile;
+  }
+
+  localDemSetStatus("Chargement de "+tile.name+"…");
+  const text = await tile.file.text();
+  const lines = text.split(/\r?\n/);
+  const expected = tile.ncols*tile.nrows;
+  const values = new Float32Array(expected);
+  let offset = 0;
+
+  for (let lineIndex=tile.headerLines; lineIndex<lines.length && offset<expected; lineIndex++) {
+    const line = lines[lineIndex].trim();
+    if (!line) continue;
+    const tokens = line.split(/\s+/);
+    for (const token of tokens) {
+      if (offset >= expected) break;
+      const value = Number(token.replace(",","."));
+      values[offset++] = Number.isFinite(value) ? value : tile.nodata;
+    }
+    if ((lineIndex-tile.headerLines)%160 === 0) {
+      await new Promise(resolve => setTimeout(resolve,0));
+      throwIfOperationCancelled();
+    }
+  }
+
+  if (offset < expected) {
+    throw new Error(tile.name+" ne contient que "+offset+" altitudes sur "+expected+" attendues.");
+  }
+
+  tile.values = values;
+  localDemTouch(tile);
+  localDemEvict(tile);
+  localDemUpdateSummary();
+  return tile;
+}
+
+function localDemUpdateSummary(extra="") {
+  const tiles = localDemState.tiles;
+  if (!tiles.length) {
+    localDemSetStatus("Aucune dalle chargée. Format attendu : ESRI ASCII Grid en Lambert-93.");
+    return;
+  }
+  const loaded = tiles.filter(tile => tile.values).length;
+  const cellSizes = [...new Set(tiles.map(tile => tile.cellsize.toFixed(2)))].join(" / ");
+  const minX = Math.min(...tiles.map(tile => tile.xMin));
+  const maxX = Math.max(...tiles.map(tile => tile.xMax));
+  const minY = Math.min(...tiles.map(tile => tile.yMin));
+  const maxY = Math.max(...tiles.map(tile => tile.yMax));
+  const message =
+    tiles.length+" dalle(s) indexée(s) · pas "+cellSizes+" m · "+
+    loaded+" en mémoire\nLambert-93 : X "+Math.round(minX)+" à "+Math.round(maxX)+
+    " · Y "+Math.round(minY)+" à "+Math.round(maxY)+
+    (extra ? "\n"+extra : "");
+  localDemSetStatus(message,"ready");
+}
+
+async function localDemIndexFiles(fileList) {
+  const files = [...(fileList || [])]
+    .filter(file => /\.(asc|txt)$/i.test(file.name));
+  if (!files.length) {
+    throw new Error("Aucun fichier ASC trouvé dans la sélection.");
+  }
+
+  localDemState.indexing = true;
+  localDemSetStatus("Indexation de "+files.length+" fichier(s)…");
+  const indexed = [];
+  const errors = [];
+
+  for (let index=0; index<files.length; index++) {
+    try {
+      indexed.push(await localDemReadHeader(files[index]));
+    } catch (error) {
+      errors.push(error.message);
+    }
+    if (index%20 === 0) await new Promise(resolve => setTimeout(resolve,0));
+  }
+
+  localDemState.indexing = false;
+  if (!indexed.length) {
+    throw new Error(errors[0] || "Aucune dalle ASC valide.");
+  }
+
+  localDemState.tiles = indexed;
+  localDemState.version++;
+  terrainCache.clear();
+  if (byId("terrainSource")?.value === "ign") byId("terrainSource").value = "auto";
+  localDemUpdateSummary(errors.length ? errors.length+" fichier(s) ignoré(s)." : "Relief local prêt.");
+}
+
+function localDemWgs84ToLambert93(latDeg,lonDeg) {
+  const radians = Math.PI/180;
+  const a = 6378137;
+  const e2 = 0.00669438002290;
+  const e = Math.sqrt(e2);
+  const phi = latDeg*radians;
+  const lambda = lonDeg*radians;
+  const phi0 = 46.5*radians;
+  const phi1 = 44*radians;
+  const phi2 = 49*radians;
+  const lambda0 = 3*radians;
+
+  const m = value => Math.cos(value)/Math.sqrt(1-e2*Math.sin(value)*Math.sin(value));
+  const t = value => {
+    const sinValue = Math.sin(value);
+    return Math.tan(Math.PI/4-value/2) /
+      Math.pow((1-e*sinValue)/(1+e*sinValue),e/2);
+  };
+
+  const t1 = t(phi1);
+  const t2 = t(phi2);
+  const n = (Math.log(m(phi1))-Math.log(m(phi2))) /
+    (Math.log(t1)-Math.log(t2));
+  const f = m(phi1)/(n*Math.pow(t1,n));
+  const rho = a*f*Math.pow(t(phi),n);
+  const rho0 = a*f*Math.pow(t(phi0),n);
+  const theta = n*(lambda-lambda0);
+
+  return {
+    x:700000+rho*Math.sin(theta),
+    y:6600000+rho0-rho*Math.cos(theta)
+  };
+}
+
+function localDemFindTile(x,y) {
+  const epsilon = 0.001;
+  return localDemState.tiles.find(tile =>
+    x >= tile.xMin-epsilon && x <= tile.xMax+epsilon &&
+    y >= tile.yMin-epsilon && y <= tile.yMax+epsilon
+  ) || null;
+}
+
+function localDemValidValue(tile,value) {
+  return Number.isFinite(value) && Math.abs(value-tile.nodata)>1e-6 && value>-99900;
+}
+
+function localDemSampleLoadedTile(tile,x,y) {
+  const centerX = tile.xMin+tile.cellsize/2;
+  const topCenterY = tile.yMax-tile.cellsize/2;
+  const column = (x-centerX)/tile.cellsize;
+  const row = (topCenterY-y)/tile.cellsize;
+
+  const c0 = Math.max(0,Math.min(tile.ncols-1,Math.floor(column)));
+  const r0 = Math.max(0,Math.min(tile.nrows-1,Math.floor(row)));
+  const c1 = Math.max(0,Math.min(tile.ncols-1,c0+1));
+  const r1 = Math.max(0,Math.min(tile.nrows-1,r0+1));
+  const fx = Math.max(0,Math.min(1,column-c0));
+  const fy = Math.max(0,Math.min(1,row-r0));
+  const samples = [
+    [r0,c0,(1-fx)*(1-fy)],
+    [r0,c1,fx*(1-fy)],
+    [r1,c0,(1-fx)*fy],
+    [r1,c1,fx*fy]
+  ];
+
+  let sum = 0;
+  let weight = 0;
+  for (const sample of samples) {
+    const value = tile.values[sample[0]*tile.ncols+sample[1]];
+    if (!localDemValidValue(tile,value)) continue;
+    sum += value*sample[2];
+    weight += sample[2];
+  }
+  if (weight <= 0) throw new Error("Altitude locale absente dans "+tile.name+".");
+  localDemTouch(tile);
+  return sum/weight;
+}
+
+async function fetchTerrainLocal(a,b,sampling,progressLabel="") {
+  if (!localDemState.tiles.length) {
+    throw new Error("Aucune dalle de relief local n’est chargée.");
+  }
+
+  const total = haversine(a.lat,a.lon,b.lat,b.lon);
+  const points = [];
+  const requiredTiles = [];
+  const requiredIds = new Set();
+
+  for (let index=0; index<sampling; index++) {
+    const t = index/(sampling-1);
+    const lat = a.lat+(b.lat-a.lat)*t;
+    const lon = a.lon+(b.lon-a.lon)*t;
+    const projected = localDemWgs84ToLambert93(lat,lon);
+    const tile = localDemFindTile(projected.x,projected.y);
+    if (!tile) {
+      const error = new Error(
+        "Relief local absent vers "+lat.toFixed(5)+", "+lon.toFixed(5)+
+        " (X "+Math.round(projected.x)+", Y "+Math.round(projected.y)+")."
+      );
+      error.localDemCoverage = true;
+      throw error;
+    }
+    if (!requiredIds.has(tile.id)) {
+      requiredIds.add(tile.id);
+      requiredTiles.push(tile);
+    }
+    points.push({t,lat,lon,x:projected.x,y:projected.y,tile});
+  }
+
+  for (let index=0; index<requiredTiles.length; index++) {
+    throwIfOperationCancelled();
+    const label = progressLabel ? progressLabel+" — " : "";
+    setCalculationOverlayDetail(label+"relief local "+(index+1)+"/"+requiredTiles.length+" : "+requiredTiles[index].name);
+    await localDemLoadTile(requiredTiles[index]);
+  }
+
+  return points.map(point => ({
+    t:point.t,
+    distanceM:total*point.t,
+    lat:point.lat,
+    lon:point.lon,
+    z:localDemSampleLoadedTile(point.tile,point.x,point.y)
+  }));
+}
+
+async function tryFetchTerrainLocal(a,b,safeSampling,mode,progressLabel) {
+  const source = localDemMode();
+  if (source === "ign") return null;
+  if (!localDemState.tiles.length) {
+    if (source === "local") throw new Error("Mode local sélectionné, mais aucune dalle ASC n’est chargée.");
+    return null;
+  }
+
+  const key = terrainCacheKey(a,b,safeSampling,mode)+"|local:"+localDemState.version;
+  if (terrainCache.has(key)) return terrainCache.get(key);
+
+  try {
+    const result = await fetchTerrainLocal(a,b,safeSampling,progressLabel);
+    terrainCache.set(key,result);
+    return result;
+  } catch (error) {
+    if (source === "local") throw error;
+    localDemUpdateSummary("Couverture locale incomplète sur le profil courant : bascule IGN automatique.");
+    return null;
+  }
+}
+
+function initLocalDemUi() {
+  const folderInput = byId("localDemFolderInput");
+  const filesInput = byId("localDemFilesInput");
+  const source = byId("terrainSource");
+  if (!folderInput || !filesInput || !source) return;
+
+  try {
+    const saved = localStorage.getItem("radioPlannerTerrainSource");
+    if (["auto","local","ign"].includes(saved)) source.value = saved;
+  } catch (_) {}
+
+  byId("localDemFolderBtn")?.addEventListener("click",()=>folderInput.click());
+  byId("localDemFilesBtn")?.addEventListener("click",()=>filesInput.click());
+  byId("localDemClearBtn")?.addEventListener("click",()=>{
+    localDemClear();
+    byId("status").textContent = "Relief local vidé.";
+  });
+
+  const load = async input => {
+    try {
+      await localDemIndexFiles(input.files);
+      showToast(localDemState.tiles.length+" dalle(s) de relief local indexée(s).");
+      byId("status").textContent = "Relief local prêt : les prochains profils utiliseront les dalles ASC.";
+    } catch (error) {
+      localDemSetStatus(error.message,"error");
+      showToast(error.message,false);
+    } finally {
+      input.value = "";
+    }
+  };
+
+  folderInput.addEventListener("change",()=>load(folderInput));
+  filesInput.addEventListener("change",()=>load(filesInput));
+  source.addEventListener("change",()=>{
+    terrainCache.clear();
+    try { localStorage.setItem("radioPlannerTerrainSource",source.value); } catch (_) {}
+    byId("status").textContent = source.value === "local"
+      ? "Source altimétrique : relief local obligatoire."
+      : source.value === "ign"
+        ? "Source altimétrique : IGN en ligne uniquement."
+        : "Source altimétrique : relief local avec retour IGN automatique.";
+  });
+  protectKeyboardEditing(source);
+  localDemUpdateSummary();
+}
+/* ===== FIN RELIEF LOCAL ===== */
+`;
+const progressiveConfig=String.raw`function routerProgressiveRosetteConfig(settings) {
+  const baseConfig = routerRosetteConfig(settings);
+  const raysPerRosace = Math.ceil(
+    360/Math.max(.1,baseConfig.azimuthStepDeg)
+  );
+  const maximumDepth = Math.max(1,Number(settings.maxRelays)||1);
+  const centersPerLayer = Math.max(1,Number(baseConfig.centersPerLayer)||1);
+  const maximumRosaceCount = 2*(
+    1+Math.max(0,maximumDepth-1)*centersPerLayer
+  );
+  const progressiveBudget = Math.ceil(
+    raysPerRosace*maximumRosaceCount*1.15
+  );
+  return {
+    ...baseConfig,
+    rayBudget:Math.max(baseConfig.rayBudget,progressiveBudget),
+    maximumRosaceCount
+  };
+}
+
+function routerProgressiveSearchTimeBudgetMs(settings) {
+  return Infinity;
+}
+`;
+patchButton.addEventListener("click",async()=>{
+ if(!selectedFile)return;
+ patchButton.disabled=true;
+ statusBox.className="status";
+ statusBox.textContent="Lecture et transformation du planificateur…";
+ try{
+  let html=await selectedFile.text();
+  if(html.includes("RELIEF_LOCAL_ASC_LAMBERT93_2026_07_23"))throw new Error("Ce fichier contient déjà le moteur de relief local.");
+  html=requiredReplace(html,"</head>",demCss+"\n</head>","fin de l’en-tête");
+  html=requiredReplace(html,'  <section class="panel">\n    <h2>Nœuds <span id="nodeCount" class="muted">(0)</span></h2>',demPanel+'\n  <section class="panel">\n    <h2>Nœuds <span id="nodeCount" class="muted">(0)</span></h2>',"panneau Nœuds");
+  html=requiredReplace(html,"async function fetchTerrain(",demCode+"\n\nasync function fetchTerrain(","fonction fetchTerrain");
+  html=requiredReplace(
+    html,
+    '  const mode = profileMode === "accurate" ? "accurate" : "simple";\n  const key = terrainCacheKey(a,b,safeSampling,mode);',
+    '  const mode = profileMode === "accurate" ? "accurate" : "simple";\n\n  const localResult = await tryFetchTerrainLocal(\n    a,b,safeSampling,mode,progressLabel\n  );\n  if (localResult) return localResult;\n\n  const key = terrainCacheKey(a,b,safeSampling,mode);',
+    "préambule de fetchTerrain"
+  );
+  html=requiredReplace(
+    html,
+    /function routerProgressiveRosetteConfig\(settings\) \{[\s\S]*?\n\}\n\nfunction routerProgressiveSearchTimeBudgetMs\([\s\S]*?\n\}\n/,
+    progressiveConfig,
+    "budgets progressifs"
+  );
+  html=html.replace(
+    /routerAutomaticDeadlineAt\s*=\s*performance\.now\(\)\s*\+\s*settings\.preset\s*\.automaticSearchTimeBudgetMs;/g,
+    "routerAutomaticDeadlineAt = Infinity;"
+  );
+  html=html.replace(
+    /routerAutomaticDeadlineAt\s*=\s*performance\.now\(\)\s*\+\s*routerProgressiveSearchTimeBudgetMs\(\s*settings\s*\);/g,
+    "routerAutomaticDeadlineAt = Infinity;"
+  );
+  html=requiredReplace(
+    html,
+    '      routerLiveSearchEnabled:\n        routerLiveSearchEnabled()\n',
+    '      routerLiveSearchEnabled:\n        routerLiveSearchEnabled(),\n      terrainSource:\n        byId("terrainSource")?.value || "auto"\n',
+    "export du projet"
+  );
+  html=requiredReplace(
+    html,
+    '    if (typeof project.settings.routerLiveSearchEnabled === "boolean")\n      byId("routerLiveSearchEnabled").checked =\n        project.settings.routerLiveSearchEnabled;\n',
+    '    if (typeof project.settings.routerLiveSearchEnabled === "boolean")\n      byId("routerLiveSearchEnabled").checked =\n        project.settings.routerLiveSearchEnabled;\n    if (["auto","local","ign"].includes(project.settings.terrainSource))\n      byId("terrainSource").value = project.settings.terrainSource;\n',
+    "import du projet"
+  );
+  html=requiredReplace(
+    html,
+    'window.addEventListener("load",() => {',
+    'initLocalDemUi();\n\nwindow.addEventListener("load",() => {',
+    "initialisation"
+  );
+  html=html.replace(/const APP_PATCH_VERSION = "[^"]+";/,'const APP_PATCH_VERSION = "relief-local-asc-routeur-complet-2026-07-23";');
+  html=html.replace(/Relief IGN/g,"Relief");
+  html=html.replace("<head>","<head>\n<!-- RELIEF_LOCAL_ASC_LAMBERT93_2026_07_23 -->");
+  const outputName="planificateur_radio_relief_local_routeur_complet.html";
+  const blob=new Blob([html],{type:"text/html;charset=utf-8"});
+  const url=URL.createObjectURL(blob);
+  const a=document.createElement("a");
+  a.href=url;
+  a.download=outputName;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(()=>URL.revokeObjectURL(url),2500);
+  statusBox.className="status ok";
+  statusBox.textContent="Transformation terminée.\nFichier généré : "+outputName+"\n\nIl contient le relief local ASC Lambert-93, le retour IGN automatique, le chargement paresseux des dalles et la recherche sans arrêt temporel prématuré.";
+ }catch(error){
+  console.error(error);
+  statusBox.className="status err";
+  statusBox.textContent="Échec : "+error.message;
+ }finally{
+  patchButton.disabled=!selectedFile;
+ }
+});
+</script>
+</body>
+</html>
