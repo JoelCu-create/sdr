@@ -1,0 +1,410 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Intégrateur corrigé du relief automatique</title>
+<script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+<style>
+:root{font-family:Inter,Segoe UI,Arial,sans-serif;color-scheme:dark}*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px;background:#07111f;color:#eef4ff}.card{width:min(860px,100%);padding:28px;border:1px solid #334b6d;border-radius:16px;background:#0d1a2e;box-shadow:0 22px 70px #0008}h1{margin:0 0 10px;font-size:25px}p{color:#b9c8da;line-height:1.55}.box{margin:18px 0;padding:16px;border:1px solid #3d5577;border-radius:12px;background:#091528}input,button{width:100%;padding:12px;border:1px solid #4a6388;border-radius:9px;background:#0b1729;color:#eef4ff;font:inherit}button{margin-top:12px;background:#047857;border-color:#10b981;font-weight:800;cursor:pointer}button:disabled{opacity:.45;cursor:not-allowed}.status{min-height:74px;margin-top:14px;padding:12px;border-radius:9px;background:#081426;color:#cbd5e1;white-space:pre-wrap}.ok{color:#6ee7b7}.err{color:#fca5a5}code{color:#93c5fd}.note{font-size:13px;border-left:3px solid #38bdf8;padding-left:12px}</style>
+</head>
+<body>
+<main class="card">
+<h1>Planificateur radio — relief automatique</h1>
+<p>Choisis le ZIP <code>planificateur_radio_relief_local_routeur_complet.zip</code>, ou directement le HTML qu’il contient.</p>
+<div class="box">
+<input id="source" type="file" accept=".zip,.html,text/html,application/zip">
+<button id="patch" disabled>Générer le planificateur complet</button>
+<div id="status" class="status">En attente du ZIP ou du HTML source.</div>
+</div>
+<p class="note">La transformation est effectuée localement dans Chrome. Le fichier source n’est pas envoyé sur Internet.</p>
+</main>
+<script>
+"use strict";
+const sourceInput=document.getElementById("source");
+const patchButton=document.getElementById("patch");
+const statusBox=document.getElementById("status");
+let selectedFile=null;
+
+sourceInput.addEventListener("change",function(){
+  selectedFile=sourceInput.files&&sourceInput.files[0]?sourceInput.files[0]:null;
+  patchButton.disabled=!selectedFile;
+  statusBox.className="status";
+  statusBox.textContent=selectedFile?"Fichier sélectionné : "+selectedFile.name:"En attente du ZIP ou du HTML source.";
+});
+
+function replaceRequired(text,search,replacement,label){
+  if(typeof search==="string"){
+    if(!text.includes(search))throw new Error("Bloc introuvable : "+label+".");
+    return text.replace(search,replacement);
+  }
+  search.lastIndex=0;
+  if(!search.test(text))throw new Error("Bloc introuvable : "+label+".");
+  search.lastIndex=0;
+  return text.replace(search,replacement);
+}
+
+async function readSource(file){
+  if(/\.zip$/i.test(file.name)||file.type==="application/zip"||file.type==="application/x-zip-compressed"){
+    if(typeof JSZip==="undefined")throw new Error("JSZip n’a pas été chargé. Vérifie la connexion Internet puis recharge la page.");
+    statusBox.textContent="Ouverture du ZIP…";
+    const zip=await JSZip.loadAsync(file);
+    const candidates=Object.values(zip.files).filter(function(entry){return !entry.dir&&/\.html?$/i.test(entry.name);});
+    candidates.sort(function(a,b){return (b._data&&b._data.uncompressedSize||0)-(a._data&&a._data.uncompressedSize||0);});
+    if(!candidates.length)throw new Error("Aucun fichier HTML trouvé dans le ZIP.");
+    statusBox.textContent="Lecture de "+candidates[0].name+"…";
+    return await candidates[0].async("string");
+  }
+  return await file.text();
+}
+
+const autoCss='\n<style id="automatic-dem-css">\n#localTerrainPanel .automaticDemBox{margin-top:9px;padding:9px;border:1px solid #0f766e;border-radius:9px;background:#071a24}\n#localTerrainPanel .automaticDemBox button{margin-top:7px;background:#065f46;border-color:#10b981}\n#localTerrainPanel .automaticDemBox label{margin-top:5px}\n#localTerrainPanel .automaticDemInfo{margin-top:7px;color:#a7f3d0;font-size:11px;line-height:1.4}\n</style>\n';
+
+const autoPanel='\n    <div class="automaticDemBox">\n      <b style="font-size:12px">Préparation automatique</b>\n      <label>Résolution du cache\n        <select id="localDemAutoResolution">\n          <option value="0" selected>Automatique selon la précision</option>\n          <option value="100">100 m — précis, plus long</option>\n          <option value="150">150 m</option>\n          <option value="250">250 m — recommandé</option>\n          <option value="500">500 m — rapide</option>\n        </select>\n      </label>\n      <button id="localDemAutoBtn" type="button">Préparer la zone automatiquement</button>\n      <div id="localDemAutoInfo" class="automaticDemInfo">La zone sera déduite du trajet, du corridor et des marges avant/arrière.</div>\n    </div>\n';
+
+const autoCode=String.raw`
+/* ===== RELIEF AUTOMATIQUE INDEXEDDB ===== */
+const autoDemState={grids:[],maxGrids:4,preparing:false,readyPromise:null,dbPromise:null};
+
+function autoDemOpenDb(){
+  if(autoDemState.dbPromise)return autoDemState.dbPromise;
+  autoDemState.dbPromise=new Promise(function(resolve,reject){
+    if(!("indexedDB" in window)){reject(new Error("IndexedDB indisponible."));return;}
+    const request=indexedDB.open("RadioPlannerAutomaticDem",1);
+    request.onupgradeneeded=function(){
+      const db=request.result;
+      if(!db.objectStoreNames.contains("grids")){
+        const store=db.createObjectStore("grids",{keyPath:"id"});
+        store.createIndex("createdAt","createdAt");
+      }
+    };
+    request.onsuccess=function(){resolve(request.result);};
+    request.onerror=function(){reject(request.error||new Error("Ouverture du cache impossible."));};
+  });
+  return autoDemState.dbPromise;
+}
+
+async function autoDemDbGetAll(){
+  const db=await autoDemOpenDb();
+  return await new Promise(function(resolve,reject){
+    const request=db.transaction("grids","readonly").objectStore("grids").getAll();
+    request.onsuccess=function(){resolve(request.result||[]);};
+    request.onerror=function(){reject(request.error);};
+  });
+}
+
+async function autoDemDbPut(grid){
+  const db=await autoDemOpenDb();
+  await new Promise(function(resolve,reject){
+    const request=db.transaction("grids","readwrite").objectStore("grids").put(grid);
+    request.onsuccess=function(){resolve();};
+    request.onerror=function(){reject(request.error);};
+  });
+}
+
+async function autoDemDbDelete(id){
+  const db=await autoDemOpenDb();
+  await new Promise(function(resolve,reject){
+    const request=db.transaction("grids","readwrite").objectStore("grids").delete(id);
+    request.onsuccess=function(){resolve();};
+    request.onerror=function(){reject(request.error);};
+  });
+}
+
+async function autoDemDbClear(){
+  const db=await autoDemOpenDb();
+  await new Promise(function(resolve,reject){
+    const request=db.transaction("grids","readwrite").objectStore("grids").clear();
+    request.onsuccess=function(){resolve();};
+    request.onerror=function(){reject(request.error);};
+  });
+}
+
+function autoDemNormalizeGrid(grid){
+  if(!grid)return null;
+  if(grid.values instanceof ArrayBuffer)grid.values=new Float32Array(grid.values);
+  else if(ArrayBuffer.isView(grid.values)&&!(grid.values instanceof Float32Array))grid.values=new Float32Array(grid.values.buffer.slice(0));
+  if(!(grid.values instanceof Float32Array))return null;
+  grid._frame=createRouterFrame(grid.startNode,grid.endNode);
+  return grid;
+}
+
+async function autoDemInit(){
+  try{
+    const stored=await autoDemDbGetAll();
+    autoDemState.grids=stored.map(autoDemNormalizeGrid).filter(Boolean).sort(function(a,b){return (b.createdAt||0)-(a.createdAt||0);}).slice(0,autoDemState.maxGrids);
+    autoDemRefreshInfo();
+    localDemUpdateSummary();
+  }catch(error){
+    console.warn("Cache automatique indisponible",error);
+    const info=byId("localDemAutoInfo");
+    if(info)info.textContent="Cache automatique indisponible : "+error.message;
+  }
+}
+
+function autoDemReady(){
+  if(!autoDemState.readyPromise)autoDemState.readyPromise=autoDemInit();
+  return autoDemState.readyPromise;
+}
+
+function autoDemResolutionM(settings){
+  const selected=Number(byId("localDemAutoResolution")&&byId("localDemAutoResolution").value);
+  if(selected>0)return selected;
+  return settings.precisionKey==="detailed"?150:(settings.precisionKey==="quick"?500:250);
+}
+
+function autoDemBuildEnvelope(routeState,settings){
+  const startNode=routeState.starts[0];
+  const endNode=routeState.ends[0];
+  const frame=createRouterFrame(startNode,endNode);
+  let stepM=autoDemResolutionM(settings);
+  const marginM=Math.max(1000,stepM*3);
+  const routeMinM=-settings.behindKm*1000-marginM;
+  const routeMaxM=frame.distanceM+settings.beyondKm*1000+marginM;
+  const lateralMinM=-settings.corridorKm*1000-marginM;
+  const lateralMaxM=settings.corridorKm*1000+marginM;
+  let cols=Math.ceil((routeMaxM-routeMinM)/stepM)+1;
+  let rows=Math.ceil((lateralMaxM-lateralMinM)/stepM)+1;
+  const maximumCells=260000;
+  if(cols*rows>maximumCells){
+    stepM*=Math.sqrt((cols*rows)/maximumCells);
+    stepM=Math.ceil(stepM/10)*10;
+    cols=Math.ceil((routeMaxM-routeMinM)/stepM)+1;
+    rows=Math.ceil((lateralMaxM-lateralMinM)/stepM)+1;
+  }
+  return {startNode:{lat:startNode.lat,lon:startNode.lon},endNode:{lat:endNode.lat,lon:endNode.lon},frame:frame,routeMinM:routeMinM,routeMaxM:routeMaxM,lateralMinM:lateralMinM,lateralMaxM:lateralMaxM,stepM:stepM,cols:cols,rows:rows};
+}
+
+function autoDemId(e){
+  return [e.startNode.lat.toFixed(5),e.startNode.lon.toFixed(5),e.endNode.lat.toFixed(5),e.endNode.lon.toFixed(5),Math.round(e.routeMinM/100),Math.round(e.routeMaxM/100),Math.round(e.lateralMinM/100),Math.round(e.lateralMaxM/100),Math.round(e.stepM)].join("|");
+}
+
+function autoDemGridContainsEnvelope(grid,e){
+  if(!grid||!grid._frame||grid.stepM>e.stepM*1.15)return false;
+  const corners=[e.frame.toLatLon(e.routeMinM,e.lateralMinM),e.frame.toLatLon(e.routeMinM,e.lateralMaxM),e.frame.toLatLon(e.routeMaxM,e.lateralMinM),e.frame.toLatLon(e.routeMaxM,e.lateralMaxM)];
+  return corners.every(function(point){
+    const local=grid._frame.toRoute(point.lat,point.lon);
+    return local.routeM>=grid.routeMinM-grid.stepM&&local.routeM<=grid.routeMaxM+grid.stepM&&local.lateralM>=grid.lateralMinM-grid.stepM&&local.lateralM<=grid.lateralMaxM+grid.stepM;
+  });
+}
+
+function autoDemFindGridForEnvelope(e){return autoDemState.grids.find(function(grid){return autoDemGridContainsEnvelope(grid,e);})||null;}
+
+function autoDemFindGridForProfile(a,b){
+  return autoDemState.grids.find(function(grid){
+    if(!grid||!grid._frame)return false;
+    return [a,b].every(function(point){
+      const local=grid._frame.toRoute(point.lat,point.lon);
+      return local.routeM>=grid.routeMinM-grid.stepM&&local.routeM<=grid.routeMaxM+grid.stepM&&local.lateralM>=grid.lateralMinM-grid.stepM&&local.lateralM<=grid.lateralMaxM+grid.stepM;
+    });
+  })||null;
+}
+
+function autoDemSample(grid,lat,lon){
+  const point=grid._frame.toRoute(lat,lon);
+  const column=(point.routeM-grid.routeMinM)/(grid.routeMaxM-grid.routeMinM)*(grid.cols-1);
+  const row=(point.lateralM-grid.lateralMinM)/(grid.lateralMaxM-grid.lateralMinM)*(grid.rows-1);
+  if(column<-.01||row<-.01||column>grid.cols-.99||row>grid.rows-.99)throw new Error("Point hors du cache automatique.");
+  const c0=Math.max(0,Math.min(grid.cols-1,Math.floor(column)));
+  const r0=Math.max(0,Math.min(grid.rows-1,Math.floor(row)));
+  const c1=Math.max(0,Math.min(grid.cols-1,c0+1));
+  const r1=Math.max(0,Math.min(grid.rows-1,r0+1));
+  const fx=Math.max(0,Math.min(1,column-c0));
+  const fy=Math.max(0,Math.min(1,row-r0));
+  const samples=[[r0,c0,(1-fx)*(1-fy)],[r0,c1,fx*(1-fy)],[r1,c0,(1-fx)*fy],[r1,c1,fx*fy]];
+  let sum=0,weight=0;
+  samples.forEach(function(sample){
+    const value=grid.values[sample[0]*grid.cols+sample[1]];
+    if(!Number.isFinite(value)||value<-9990)return;
+    sum+=value*sample[2];weight+=sample[2];
+  });
+  if(weight<=0)throw new Error("Altitude absente du cache automatique.");
+  grid.lastUse=Date.now();
+  return sum/weight;
+}
+
+function autoDemFetchTerrain(a,b,sampling){
+  const grid=autoDemFindGridForProfile(a,b);
+  if(!grid)return null;
+  const total=haversine(a.lat,a.lon,b.lat,b.lon);
+  const result=[];
+  for(let index=0;index<sampling;index++){
+    const t=index/(sampling-1);
+    const lat=a.lat+(b.lat-a.lat)*t;
+    const lon=a.lon+(b.lon-a.lon)*t;
+    result.push({t:t,distanceM:total*t,lat:lat,lon:lon,z:autoDemSample(grid,lat,lon)});
+  }
+  return result;
+}
+
+function autoDemRefreshInfo(extra){
+  const target=byId("localDemAutoInfo");
+  if(!target)return;
+  if(!autoDemState.grids.length){target.textContent=extra||"Aucune zone automatique en cache. Elle sera préparée au prochain calcul du routeur.";return;}
+  const latest=autoDemState.grids[0];
+  target.textContent=autoDemState.grids.length+" zone(s) en cache · dernière : "+latest.cols+" × "+latest.rows+" points · pas "+Math.round(latest.stepM)+" m"+(extra?" · "+extra:"");
+}
+
+async function autoDemSaveGrid(grid){
+  grid.createdAt=Date.now();grid.lastUse=grid.createdAt;grid._frame=undefined;
+  await autoDemDbPut(grid);
+  grid._frame=createRouterFrame(grid.startNode,grid.endNode);
+  autoDemState.grids=[grid].concat(autoDemState.grids.filter(function(item){return item.id!==grid.id;})).sort(function(a,b){return (b.createdAt||0)-(a.createdAt||0);});
+  while(autoDemState.grids.length>autoDemState.maxGrids){const removed=autoDemState.grids.pop();await autoDemDbDelete(removed.id);}
+  localDemState.version++;terrainCache.clear();autoDemRefreshInfo("Relief automatique prêt");localDemUpdateSummary();
+}
+
+async function autoDemClearAll(){autoDemState.grids=[];terrainCache.clear();localDemState.version++;try{await autoDemDbClear();}catch(error){console.warn(error);}autoDemRefreshInfo();localDemUpdateSummary();}
+
+async function autoDemPrepare(routeState,settings,options){
+  options=options||{};
+  await autoDemReady();
+  if(autoDemState.preparing)throw new Error("Une préparation est déjà en cours.");
+  if(!routeState||!routeState.valid)throw new Error("Affecte exactement un départ et une arrivée.");
+  if(localDemState.tiles.length&&!options.force){autoDemRefreshInfo("Dalles ASC manuelles déjà disponibles");return true;}
+  const envelope=autoDemBuildEnvelope(routeState,settings);
+  const existing=autoDemFindGridForEnvelope(envelope);
+  if(existing&&!options.force){autoDemState.grids=[existing].concat(autoDemState.grids.filter(function(grid){return grid!==existing;}));autoDemRefreshInfo("La zone demandée est déjà couverte");localDemUpdateSummary();return true;}
+  const source=byId("terrainSource");
+  const previousSource=source?source.value:"auto";
+  const values=new Float32Array(envelope.cols*envelope.rows);
+  autoDemState.preparing=true;operationCancelled=false;
+  try{
+    if(source)source.value="ign";
+    showCalculationOverlay(envelope.rows,{title:"Préparation automatique du relief",message:"Zone "+Math.round((envelope.routeMaxM-envelope.routeMinM)/1000)+" × "+Math.round((envelope.lateralMaxM-envelope.lateralMinM)/1000)+" km · "+envelope.cols+" × "+envelope.rows+" points · pas "+Math.round(envelope.stepM)+" m.",unitLabel:"ligne"});
+    for(let row=0;row<envelope.rows;row++){
+      throwIfOperationCancelled();
+      const fraction=envelope.rows===1?0:row/(envelope.rows-1);
+      const lateralM=envelope.lateralMinM+(envelope.lateralMaxM-envelope.lateralMinM)*fraction;
+      const a=envelope.frame.toLatLon(envelope.routeMinM,lateralM);
+      const b=envelope.frame.toLatLon(envelope.routeMaxM,lateralM);
+      updateCalculationOverlay(row,envelope.rows,"Téléchargement du relief de la zone","Ligne "+(row+1)+"/"+envelope.rows+" · "+envelope.cols+" altitudes.");
+      const raw=await fetchTerrain(a,b,envelope.cols,"simple","Cache relief "+(row+1)+"/"+envelope.rows,{maxAttempts:4,timeoutMs:25000});
+      for(let column=0;column<envelope.cols;column++)values[row*envelope.cols+column]=Number(raw[column]&&raw[column].z);
+      if(row%2===0)await waitForUiPaint();
+    }
+    const grid={id:autoDemId(envelope),startNode:envelope.startNode,endNode:envelope.endNode,routeMinM:envelope.routeMinM,routeMaxM:envelope.routeMaxM,lateralMinM:envelope.lateralMinM,lateralMaxM:envelope.lateralMaxM,stepM:envelope.stepM,cols:envelope.cols,rows:envelope.rows,values:values};
+    await autoDemSaveGrid(grid);
+    setCalculationOverlayState("success","Relief automatique prêt",(envelope.cols*envelope.rows)+" altitudes mises en cache local.");
+    byId("status").textContent="Relief automatique prêt : la recherche utilisera le cache local.";
+    showToast("Relief automatique prêt.");
+    if(options.manual){await sleep(650);hideCalculationOverlay();}
+    return true;
+  }catch(error){
+    if(options.manual){setCalculationOverlayState("error","Préparation impossible",error.message);await sleep(900);hideCalculationOverlay();}
+    throw error;
+  }finally{if(source)source.value=previousSource;autoDemState.preparing=false;}
+}
+
+async function autoDemEnsureForRoute(routeState,settings){
+  const source=localDemMode();
+  if(source==="ign")return false;
+  try{return await autoDemPrepare(routeState,settings,{force:false,manual:false});}
+  catch(error){
+    if(source==="local")throw error;
+    console.warn("Préparation automatique échouée, retour IGN",error);
+    autoDemRefreshInfo("Préparation impossible : retour IGN pour cette recherche");
+    localDemSetStatus("Préparation automatique impossible : "+error.message+" Retour IGN actif.","error");
+    return false;
+  }
+}
+
+async function autoDemTryFetchTerrain(a,b,safeSampling,mode){
+  const source=localDemMode();
+  if(source==="ign")return null;
+  await autoDemReady();
+  const key=terrainCacheKey(a,b,safeSampling,mode)+"|automatic:"+localDemState.version;
+  if(terrainCache.has(key))return terrainCache.get(key);
+  try{const result=autoDemFetchTerrain(a,b,safeSampling);if(!result)return null;terrainCache.set(key,result);return result;}
+  catch(error){if(source==="local"&&!localDemState.tiles.length)throw error;return null;}
+}
+
+function autoDemInitUi(){
+  const button=byId("localDemAutoBtn");
+  const resolution=byId("localDemAutoResolution");
+  if(resolution){
+    try{const saved=localStorage.getItem("radioPlannerAutoDemResolution");if(["0","100","150","250","500"].includes(saved))resolution.value=saved;}catch(error){}
+    resolution.addEventListener("change",function(){try{localStorage.setItem("radioPlannerAutoDemResolution",resolution.value);}catch(error){}});
+    protectKeyboardEditing(resolution);
+  }
+  if(button)button.addEventListener("click",async function(){
+    if(autoDemState.preparing)return;
+    const routeState=getRouteState();
+    if(!routeState.valid){showToast("Affecte exactement un départ et une arrivée.",false);return;}
+    button.disabled=true;const original=button.textContent;button.textContent="Préparation en cours…";
+    try{await autoDemPrepare(routeState,routerSettings(),{force:false,manual:true});}
+    catch(error){showToast(error.message,false);}
+    finally{button.disabled=false;button.textContent=original;}
+  });
+  const clearButton=byId("localDemClearBtn");
+  if(clearButton)clearButton.addEventListener("click",function(){autoDemClearAll().catch(console.warn);});
+  autoDemReady();
+}
+
+const localDemUpdateSummaryOriginal=localDemUpdateSummary;
+localDemUpdateSummary=function(extra){
+  localDemUpdateSummaryOriginal(extra||"");
+  if(!localDemState.tiles.length&&autoDemState.grids.length){
+    const grid=autoDemState.grids[0];
+    localDemSetStatus(autoDemState.grids.length+" zone(s) automatique(s) en cache · dernière "+grid.cols+" × "+grid.rows+" points · pas "+Math.round(grid.stepM)+" m"+(extra?"\n"+extra:""),"ready");
+  }
+};
+/* ===== FIN RELIEF AUTOMATIQUE ===== */
+`;
+
+const localReplacement=String.raw`async function tryFetchTerrainLocal(a,b,safeSampling,mode,progressLabel) {
+  const source=localDemMode();
+  if(source==="ign")return null;
+  const automaticResult=await autoDemTryFetchTerrain(a,b,safeSampling,mode);
+  if(automaticResult)return automaticResult;
+  if(!localDemState.tiles.length){
+    if(source==="local")throw new Error("Mode local sélectionné, mais aucune zone automatique ni dalle ASC ne couvre ce profil.");
+    return null;
+  }
+  const key=terrainCacheKey(a,b,safeSampling,mode)+"|local:"+localDemState.version;
+  if(terrainCache.has(key))return terrainCache.get(key);
+  try{
+    const result=await fetchTerrainLocal(a,b,safeSampling,progressLabel);
+    terrainCache.set(key,result);
+    return result;
+  }catch(error){
+    if(source==="local")throw error;
+    localDemUpdateSummary("Couverture locale incomplète : bascule IGN automatique.");
+    return null;
+  }
+}
+`;
+
+patchButton.addEventListener("click",async function(){
+  if(!selectedFile)return;
+  patchButton.disabled=true;
+  statusBox.className="status";
+  statusBox.textContent="Lecture et transformation du planificateur…";
+  try{
+    let html=await readSource(selectedFile);
+    if(!html.includes("RELIEF_LOCAL_ASC_LAMBERT93_2026_07_23")&&!html.includes("RELIEF LOCAL ASC LAMBERT-93"))throw new Error("Le fichier ne contient pas le moteur Relief local attendu.");
+    if(html.includes("RELIEF_AUTOMATIQUE_INDEXEDDB_2026_07_23"))throw new Error("Ce fichier contient déjà le relief automatique.");
+    html=replaceRequired(html,"</head>",autoCss+"\n</head>","fin de l’en-tête");
+    html=replaceRequired(html,'    <div class="localDemButtons">',autoPanel+'\n    <div class="localDemButtons">',"panneau Relief local");
+    html=replaceRequired(html,/async function tryFetchTerrainLocal\(a,b,safeSampling,mode,progressLabel\) \{[\s\S]*?\n\}\n\nfunction initLocalDemUi\(\) \{/,localReplacement+"\nfunction initLocalDemUi() {","sélection du relief local");
+    html=replaceRequired(html,'  localDemUpdateSummary();\n}\n/* ===== FIN RELIEF LOCAL ===== */','  localDemUpdateSummary();\n  autoDemInitUi();\n}\n/* ===== FIN RELIEF LOCAL ===== */',"initialisation automatique");
+    html=replaceRequired(html,"/* ===== FIN RELIEF LOCAL ===== */",autoCode+"\n/* ===== FIN RELIEF LOCAL ===== */","fin du moteur Relief local");
+    html=replaceRequired(html,/try \{\n(\s*)updateCalculationOverlay\(\n(\s*)0,\n(\s*)config\.rayBudget,\n(\s*)"Test de la liaison directe"/,"try {\n    if (localDemMode() !== \"ign\") {\n      button.textContent = \"Préparation automatique du relief…\";\n      await autoDemEnsureForRoute(routeState,settings);\n      button.textContent = \"Propagation des rosaces…\";\n    }\n\n    updateCalculationOverlay(\n      0,\n      config.rayBudget,\n      \"Test de la liaison directe\"","démarrage du routeur");
+    html=html.replace("<head>","<head>\n<!-- RELIEF_AUTOMATIQUE_INDEXEDDB_2026_07_23 -->");
+    html=html.replace(/const APP_PATCH_VERSION = "[^"]+";/,'const APP_PATCH_VERSION = "relief-automatique-indexeddb-routeur-2026-07-23";');
+    const outputName="planificateur_radio_relief_automatique_routeur_complet.html";
+    const blob=new Blob([html],{type:"text/html;charset=utf-8"});
+    const url=URL.createObjectURL(blob);
+    const link=document.createElement("a");
+    link.href=url;link.download=outputName;document.body.appendChild(link);link.click();link.remove();setTimeout(function(){URL.revokeObjectURL(url);},3000);
+    statusBox.className="status ok";
+    statusBox.textContent="Transformation terminée.\nFichier généré : "+outputName;
+  }catch(error){
+    console.error(error);
+    statusBox.className="status err";
+    statusBox.textContent="Échec : "+error.message;
+  }finally{patchButton.disabled=!selectedFile;}
+});
+</script>
+</body>
+</html>
