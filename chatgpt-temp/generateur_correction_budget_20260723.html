@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Correcteur du budget du routeur radio</title>
+<style>
+:root{font-family:Inter,Segoe UI,Arial,sans-serif;color-scheme:dark}*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px;background:#07111f;color:#eef4ff}.card{width:min(760px,100%);padding:26px;border:1px solid #334b6d;border-radius:16px;background:#0d1a2e;box-shadow:0 22px 70px #0008}h1{margin:0 0 10px;font-size:24px}p{color:#b9c8da;line-height:1.55}.box{margin:18px 0;padding:16px;border:1px solid #3d5577;border-radius:12px;background:#091528}input,button{width:100%;padding:12px;border:1px solid #4a6388;border-radius:9px;background:#0b1729;color:#eef4ff;font:inherit}button{margin-top:12px;background:#047857;border-color:#10b981;font-weight:800;cursor:pointer}button:disabled{opacity:.45;cursor:not-allowed}.status{min-height:46px;margin-top:14px;padding:12px;border-radius:9px;background:#081426;color:#cbd5e1;white-space:pre-wrap}.ok{color:#6ee7b7}.err{color:#fca5a5}code{color:#93c5fd}</style>
+</head>
+<body>
+<main class="card">
+<h1>Correcteur du routeur progressif</h1>
+<p>Choisis le dernier fichier <code>planificateur_radio_routeur_progressif_rosaces_visibles.html</code>. Le correcteur génère ensuite le HTML complet sans arrêt prématuré dû au budget.</p>
+<div class="box">
+<input id="source" type="file" accept=".html,text/html">
+<button id="patch" disabled>Générer le HTML complet corrigé</button>
+<div id="status" class="status">En attente du fichier source.</div>
+</div>
+<p>Le fichier source n’est pas envoyé sur Internet : la modification est effectuée localement dans ton navigateur.</p>
+</main>
+<script>
+"use strict";
+const sourceInput=document.getElementById("source");
+const patchButton=document.getElementById("patch");
+const statusBox=document.getElementById("status");
+let selectedFile=null;
+sourceInput.addEventListener("change",()=>{
+ selectedFile=sourceInput.files?.[0]||null;
+ patchButton.disabled=!selectedFile;
+ statusBox.className="status";
+ statusBox.textContent=selectedFile?`Fichier sélectionné : ${selectedFile.name}`:"En attente du fichier source.";
+});
+function replaceOnce(text,regex,replacement,label){
+ const matches=text.match(regex);
+ if(!matches) throw new Error(`Bloc introuvable : ${label}. Vérifie que tu as choisi la dernière version du planificateur.`);
+ return text.replace(regex,replacement);
+}
+patchButton.addEventListener("click",async()=>{
+ if(!selectedFile)return;
+ patchButton.disabled=true;
+ statusBox.className="status";
+ statusBox.textContent="Lecture et correction du fichier…";
+ try{
+  let html=await selectedFile.text();
+  const configBlock=/function routerProgressiveRosetteConfig\(settings\) \{[\s\S]*?\n\}\n\nfunction routerProgressiveSearchTimeBudgetMs\([\s\S]*?\n\}\n/;
+  const correctedConfig=`function routerProgressiveRosetteConfig(settings) {
+  const baseConfig =
+    routerRosetteConfig(settings);
+
+  const raysPerRosace =
+    Math.ceil(
+      360/
+      Math.max(
+        .1,
+        baseConfig.azimuthStepDeg
+      )
+    );
+
+  /*
+   * Toutes les profondeurs susceptibles d'être demandées sont
+   * budgétées pour les DEUX côtés de la recherche.
+   *
+   * Profondeur 1 : une rosace au départ et une à l'arrivée.
+   * Profondeurs suivantes : jusqu'à centersPerLayer rosaces
+   * de chaque côté. L'ancienne formule oubliait le facteur 2
+   * et plafonnait artificiellement le nombre de centres à 2.
+   */
+  const maximumDepth =
+    Math.max(
+      1,
+      Number(settings.maxRelays) || 1
+    );
+
+  const centersPerLayer =
+    Math.max(
+      1,
+      Number(baseConfig.centersPerLayer) || 1
+    );
+
+  const maximumRosaceCount =
+    2 * (
+      1 +
+      Math.max(0,maximumDepth-1) *
+        centersPerLayer
+    );
+
+  const progressiveBudget =
+    Math.ceil(
+      raysPerRosace *
+      maximumRosaceCount *
+      1.15
+    );
+
+  return {
+    ...baseConfig,
+    rayBudget:
+      Math.max(
+        baseConfig.rayBudget,
+        progressiveBudget
+      ),
+    maximumRosaceCount
+  };
+}
+
+function routerProgressiveSearchTimeBudgetMs(
+  settings,
+  config=null
+) {
+  /*
+   * Le parcours est fini : il s'arrête naturellement lorsque le
+   * nombre maximal de relais a été exploré. On ne lui impose plus
+   * une limite globale susceptible de l'arrêter à mi-chemin.
+   * Les délais individuels des requêtes IGN et le bouton Annuler
+   * restent actifs.
+   */
+  return Infinity;
+}
+`;
+  html=replaceOnce(html,configBlock,correctedConfig,"configuration progressive");
+
+  const deadlineBlock=/routerAutomaticDeadlineAt\s*=\s*performance\.now\(\)\s*\+\s*routerProgressiveSearchTimeBudgetMs\(\s*settings\s*\);/;
+  html=replaceOnce(html,deadlineBlock,"routerAutomaticDeadlineAt = Infinity;","limite temporelle globale");
+
+  html=html.replace(
+    "`budget maximal ${config.rayBudget} rayons IGN.`",
+    "`budget complet ${config.rayBudget} rayons IGN, sans arrêt temporel global.`"
+  );
+
+  const marker="ROUTEUR_PROGRESSIF_BUDGET_COMPLET_2026_07_23";
+  if(!html.includes(marker)){
+    html=html.replace(
+      "<head>",
+      `<head>\n<!-- ${marker} -->`
+    );
+  }
+
+  const outputName="planificateur_radio_routeur_progressif_budget_complet.html";
+  const blob=new Blob([html],{type:"text/html;charset=utf-8"});
+  const url=URL.createObjectURL(blob);
+  const a=document.createElement("a");
+  a.href=url;
+  a.download=outputName;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(()=>URL.revokeObjectURL(url),2000);
+  statusBox.className="status ok";
+  statusBox.textContent=`Correction terminée.\nFichier généré : ${outputName}\nLe budget couvre maintenant toutes les profondeurs, des deux côtés, jusqu'au nombre maximal de relais.`;
+ }catch(error){
+  console.error(error);
+  statusBox.className="status err";
+  statusBox.textContent=`Échec : ${error.message}`;
+ }finally{
+  patchButton.disabled=!selectedFile;
+ }
+});
+</script>
+</body>
+</html>
